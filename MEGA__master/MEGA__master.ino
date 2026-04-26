@@ -77,11 +77,13 @@ constexpr int DEFAULT_TIMELAPSE_STEP_DIST_MS = 250;  // Increased from 100ms for
 int stepDist = DEFAULT_TIMELAPSE_STEP_DIST_MS;
 constexpr unsigned long DEFAULT_TIMELAPSE_SETTLE_DWELL_MS = 500;
 unsigned long timelapseSettleDwellMs = DEFAULT_TIMELAPSE_SETTLE_DWELL_MS;
-constexpr uint8_t DEFAULT_TIMELAPSE_MAX_SPEED_STAGE = 4;  // 1-4; limits max velocity during ramp
-constexpr uint8_t TIMELAPSE_MAX_SPEED_STAGE_MIN = 1;
+constexpr uint8_t DEFAULT_TIMELAPSE_MAX_SPEED_STAGE = 4;  // 0-4; limits max velocity during ramp
+constexpr uint8_t TIMELAPSE_MAX_SPEED_STAGE_MIN = 0;
 constexpr uint8_t TIMELAPSE_MAX_SPEED_STAGE_MAX = 4;
 uint8_t timelapseMaxSpeedStage = DEFAULT_TIMELAPSE_MAX_SPEED_STAGE;
 const uint8_t trigger = 28;
+constexpr uint8_t TRIGGER_IDLE_STATE = LOW;
+constexpr uint8_t TRIGGER_ACTIVE_STATE = HIGH;
 
 // Timelapse motion ramping parameters for smooth camera movement
 constexpr bool DEFAULT_TIMELAPSE_ANTI_BACKLASH_ENABLED = true;
@@ -313,7 +315,7 @@ constexpr float FLOWLAPSE_AXIS_MED_ERROR = 4.0f;
 constexpr float FLOWLAPSE_AXIS_HIGH_ERROR = 12.0f;
 constexpr float FLOWLAPSE_MIN_WAYPOINT_SEPARATION = 2.5f;
 constexpr float FLOWLAPSE_MANUAL_TRACK_RATE_UNITS_PER_SEC = 14.0f;
-constexpr float FLOWLAPSE_MED_RATE_UNITS_PER_SEC = 10.0f;
+constexpr float FLOWLAPSE_MED_RATE_UNITS_PER_SEC = 14.0f;
 constexpr float FLOWLAPSE_HIGH_RATE_UNITS_PER_SEC = 18.0f;
 constexpr unsigned long FLOWLAPSE_CAPTURE_PROGRESS_LOG_MS = 2000;
 constexpr bool FLOWLAPSE_CURVED_PATH_ENABLED = true; // smooth Catmull-Rom path during capture move phase
@@ -647,6 +649,7 @@ unsigned long flowlapseSwingTierLastChangeMs = 0;
 unsigned long flowlapseLiftTierLastChangeMs = 0;
 unsigned long flowlapsePanTierLastChangeMs = 0;
 unsigned long flowlapseTiltTierLastChangeMs = 0;
+uint8_t lastManualMotionAxisSpeedStage = DEFAULT_AXIS_SPEED_STAGE;
 uint8_t droneManualSwingTier = DEFAULT_AXIS_SPEED_STAGE;
 uint8_t droneManualLiftTier = DEFAULT_AXIS_SPEED_STAGE;
 uint8_t droneManualPanTier = DEFAULT_AXIS_SPEED_STAGE;
@@ -825,7 +828,7 @@ void emitLoopBypassReason(const char* reasonTag) {
   broadcastStatus(bypassLine);
 }
 
-void handleAxisSpeedControl(uint16_t buttonCode, uint8_t axis1Pin, uint8_t axis2Pin, const char* eventTag) {
+void handleAxisSpeedControl(uint16_t buttonCode, uint8_t axis1Pin, uint8_t axis2Pin, int8_t stageDelta, const char* eventTag) {
   const bool held    = ps2x.Button(buttonCode);
   const bool pressed = ps2x.ButtonPressed(buttonCode);
   const bool released = ps2x.ButtonReleased(buttonCode);
@@ -850,6 +853,8 @@ void handleAxisSpeedControl(uint16_t buttonCode, uint8_t axis1Pin, uint8_t axis2
   if (pressed) {
     pulseSpeedStageUpPin(axis1Pin);
     pulseSpeedStageUpPin(axis2Pin);
+    int updatedStage = static_cast<int>(lastManualMotionAxisSpeedStage) + static_cast<int>(stageDelta);
+    lastManualMotionAxisSpeedStage = static_cast<uint8_t>(constrain(updatedStage, 0, 4));
     emitControlIndicator(eventTag);
     emitSpeedTestEvent(eventTag, "PRESS");
   } else if (released) {
@@ -923,6 +928,12 @@ void normalizeMotionAxisSpeedStages(uint8_t targetStage) {
   for (uint8_t i = 0; i < clampedTargetStage; ++i) {
     pulseAllMotionAxisSpeedPins(swingSpeedUp, panSpeedUp, liftSpeedUp, tiltSpeedUp);
   }
+}
+
+uint8_t getBounceManualMaxSpeedTier() {
+  return static_cast<uint8_t>(constrain(static_cast<int>(lastManualMotionAxisSpeedStage),
+      static_cast<int>(DRONE_SPEED_TIER_STOP),
+      static_cast<int>(DRONE_SPEED_TIER_HIGH)));
 }
 
 void setDirectionalOutput(bool isReversed, uint8_t normalPin, uint8_t reversedPin, uint8_t state) {
@@ -1434,7 +1445,7 @@ void resetFlowlapseSession(bool resetEstimatedPosition) {
   flowlapseTotalPausedMs = 0;
   flowlapsePingPongEdgeCount = 0;
   resetFlowlapseAxisTierState(flowlapseLastUpdateMs);
-  digitalWrite(trigger, HIGH);
+  digitalWrite(trigger, TRIGGER_IDLE_STATE);
 
   if (resetEstimatedPosition) {
     flowlapseCurrentSwingPos = 0.0f;
@@ -1819,31 +1830,14 @@ void startFlowlapsePreview() {
     return;
   }
 
-  bool useCurvedPath = FLOWLAPSE_CURVED_PATH_ENABLED && flowlapseWaypointCount >= 3;
   flowlapseState = FLOWLAPSE_STATE_PREVIEW_RUNNING;
-  flowlapseTargetWaypointIndex = 0;
+  flowlapseTargetWaypointIndex = static_cast<uint8_t>(flowlapseWaypointCount - 1);
   flowlapsePreviewHoldUntilMs = 0;
-  flowlapsePreviewFrameModeActive = flowlapseFrameCountModeEnabled;
-  flowlapsePreviewFrameTarget = FLOWLAPSE_FRAME_COUNT_TARGET;
-  if (flowlapsePreviewFrameTarget < 2) {
-    flowlapsePreviewFrameTarget = 2;
-  }
+  flowlapsePreviewFrameModeActive = false;
+  flowlapsePreviewFrameTarget = 0;
   flowlapsePreviewFrameStopIndex = 0;
-
-  if (flowlapsePreviewFrameModeActive) {
-    rebuildFlowlapsePathLengthCache(useCurvedPath);
-    Serial.print(F("Flowlapse: frame-count preview started. frames="));
-    Serial.print(flowlapsePreviewFrameTarget);
-    Serial.print(F(" spacing="));
-    float pathTotalLength = getFlowlapsePathTotalLength();
-    float previewSpacing = (flowlapsePreviewFrameTarget > 1)
-        ? (pathTotalLength / static_cast<float>(flowlapsePreviewFrameTarget - 1))
-        : 0.0f;
-    Serial.println(previewSpacing, 1);
-  } else {
-    Serial.println(F("Flowlapse: preview started."));
-    broadcastStatus("Flowlapse: preview started.");
-  }
+  Serial.println(F("Flowlapse: returning through recorded waypoints to waypoint 1."));
+  broadcastStatus("Flowlapse: returning to waypoint 1.");
 
   resetFlowlapseAxisTierState(millis());
 }
@@ -2791,13 +2785,13 @@ void completeFlowlapsePreview() {
   flowlapsePreviewFrameModeActive = false;
   flowlapsePreviewFrameTarget = 0;
   flowlapsePreviewFrameStopIndex = 0;
-  Serial.println(F("Flowlapse: preview complete. Press START to run capture."));
-  broadcastStatus("Flowlapse: preview complete. Press START to run capture.");
+  Serial.println(F("Flowlapse: return to waypoint 1 complete. Press START to run capture."));
+  broadcastStatus("Flowlapse: return to waypoint 1 complete. Press START to run capture.");
 }
 
 void completeFlowlapseCapture(unsigned long now) {
   stopAllMotors();
-  digitalWrite(trigger, HIGH);
+  digitalWrite(trigger, TRIGGER_IDLE_STATE);
 
   if (flowlapseFrameCountModeActive && FLOWLAPSE_FRAMECOUNT_AUTO_EXIT) {
     Serial.print(F("Frame-count capture complete ("));
@@ -2923,20 +2917,6 @@ void handleFlowlapsePreviewStep(unsigned long now, float deltaSeconds) {
     return;
   }
 
-  if (flowlapsePreviewHoldUntilMs != 0) {
-    stopAllMotors();
-    if (now < flowlapsePreviewHoldUntilMs) {
-      return;
-    }
-
-    flowlapsePreviewHoldUntilMs = 0;
-    flowlapseTargetWaypointIndex++;
-    if (flowlapseTargetWaypointIndex >= flowlapseWaypointCount) {
-      completeFlowlapsePreview();
-      return;
-    }
-  }
-
   const FlowlapseWaypoint& target = flowlapseWaypoints[flowlapseTargetWaypointIndex];
   float previewSpeedMultiplier = ps2x.Button(PSB_L2) ? FLOWLAPSE_PREVIEW_SPEED_BOOST : FLOWLAPSE_PREVIEW_SPEED_SCALE;
   float scaledPreviewDeltaSeconds = deltaSeconds * previewSpeedMultiplier;
@@ -2944,14 +2924,14 @@ void handleFlowlapsePreviewStep(unsigned long now, float deltaSeconds) {
 
   if (isFlowlapseTargetReached(target)) {
     stopAllMotors();
-    flowlapsePreviewHoldUntilMs = now + FLOWLAPSE_PREVIEW_POINT_HOLD_MS;
-    Serial.print(F("Flowlapse preview reached waypoint "));
-    Serial.println(flowlapseTargetWaypointIndex + 1);
-    char previewWaypointLine[48];
-    snprintf(previewWaypointLine, sizeof(previewWaypointLine), "PREVIEW_WAYPOINT:%u/%u",
-             static_cast<unsigned int>(flowlapseTargetWaypointIndex + 1),
-             static_cast<unsigned int>(flowlapseWaypointCount));
-    broadcastStatus(previewWaypointLine);
+    if (flowlapseTargetWaypointIndex == 0) {
+      completeFlowlapsePreview();
+      return;
+    }
+
+    Serial.print(F("Flowlapse return reached waypoint "));
+    Serial.println(static_cast<unsigned int>(flowlapseTargetWaypointIndex + 1));
+    flowlapseTargetWaypointIndex--;
   }
 }
 
@@ -2983,9 +2963,9 @@ void handleFlowlapseCaptureStep(unsigned long now, float deltaSeconds) {
   switch (flowlapseCapturePhase) {
     case FLOWLAPSE_CAPTURE_TRIGGER_LOW:
       stopAllMotors();
-      digitalWrite(trigger, LOW);
+      digitalWrite(trigger, TRIGGER_ACTIVE_STATE);
       if (now - flowlapseCapturePhaseStartMs >= static_cast<unsigned long>(timelapseIntervalMs / 2)) {
-        digitalWrite(trigger, HIGH);
+        digitalWrite(trigger, TRIGGER_IDLE_STATE);
         flowlapseCapturePhase = FLOWLAPSE_CAPTURE_TRIGGER_HIGH;
         flowlapseCapturePhaseStartMs = now;
       }
@@ -2993,7 +2973,7 @@ void handleFlowlapseCaptureStep(unsigned long now, float deltaSeconds) {
 
     case FLOWLAPSE_CAPTURE_TRIGGER_HIGH:
       stopAllMotors();
-      digitalWrite(trigger, HIGH);
+      digitalWrite(trigger, TRIGGER_IDLE_STATE);
       if (now - flowlapseCapturePhaseStartMs >= static_cast<unsigned long>(timelapseIntervalMs / 2)) {
         if (flowlapseFrameCountModeActive) {
           uint16_t nextStopIndex = static_cast<uint16_t>(flowlapseFrameCountCurrentStopIndex + 1);
@@ -3211,9 +3191,9 @@ bool handleDroneFlowlapseButtons(unsigned long now) {
       && !ps2x.Button(PSB_SELECT);
 
   if (r1Pressed && manualShutterAllowed && manualShutterComboClear) {
-    digitalWrite(trigger, LOW);
+    digitalWrite(trigger, TRIGGER_ACTIVE_STATE);
     delay(DRONE_MANUAL_SHUTTER_PULSE_MS);
-    digitalWrite(trigger, HIGH);
+    digitalWrite(trigger, TRIGGER_IDLE_STATE);
     emitControlIndicator("DRONE_MANUAL_SHUTTER");
     broadcastStatus("TRIGGER:MANUAL_DRONE");
     droneLastActivityMs = now;
@@ -3611,8 +3591,8 @@ bool handleDroneFlowlapseButtons(unsigned long now) {
         flowlapseState = FLOWLAPSE_STATE_READY_FOR_PREVIEW;
         stopAllMotors();
         startFeedbackRumble(flowlapseWaypointCount, FLOWLAPSE_WAYPOINT_RUMBLE_ON_MS, FLOWLAPSE_WAYPOINT_RUMBLE_TOTAL_MS);
-        Serial.println(F("Flowlapse: recording stopped. Press SELECT again for preview."));
-        broadcastStatus("Flowlapse: recording stopped. Press SELECT again for preview.");
+        Serial.println(F("Flowlapse: recording stopped. Press SELECT to return to waypoint 1."));
+        broadcastStatus("Flowlapse: recording stopped. Press SELECT to return to waypoint 1.");
       }
       droneLastActivityMs = now;
     } else if (flowlapseState == FLOWLAPSE_STATE_READY_FOR_PREVIEW || flowlapseState == FLOWLAPSE_STATE_READY_FOR_CAPTURE) {
@@ -3643,7 +3623,7 @@ bool handleDroneFlowlapseButtons(unsigned long now) {
     } else {
       if (flowlapseState == FLOWLAPSE_STATE_PREVIEW_RUNNING) {
         completeFlowlapsePreview();
-        Serial.println(F("Flowlapse: preview skipped by START; capture is now ready."));
+        Serial.println(F("Flowlapse: return-to-origin skipped by START; capture is now ready."));
         droneLastActivityMs = now;
       } else if (flowlapseState == FLOWLAPSE_STATE_CAPTURE_RUNNING) {
         // Pause capture
@@ -3676,7 +3656,7 @@ bool handleDroneFlowlapseButtons(unsigned long now) {
         droneLastActivityMs = now;
       } else if (flowlapseState == FLOWLAPSE_STATE_READY_FOR_PREVIEW) {
         startLockoutDeniedRumbleFeedback();
-        Serial.println(F("Flowlapse: run preview first (SELECT), then press START for capture."));
+        Serial.println(F("Flowlapse: return to waypoint 1 first (SELECT), then press START for capture."));
         droneLastActivityMs = now;
       }
     }
@@ -4623,7 +4603,7 @@ bool handleTimelapseSettleDwellAdjustment() {
 }
 
 // START + L2 decreases max speed stage. START + R2 increases max speed stage.
-// Speed stage changes by 1 per press (1 is slowest, 4 is fastest).
+// Speed stage changes by 1 per press (0 is slowest, 4 is fastest).
 bool handleTimelapseMaxSpeedStageAdjustment() {
   bool adjustmentAllowed = !isAutoModeActive();
   bool stageAdjustUpComboRawActive = ps2x.Button(PSB_START) && ps2x.Button(PSB_R2);
@@ -4661,7 +4641,7 @@ bool handleTimelapseMaxSpeedStageAdjustment() {
         broadcastStatus(statusBuf);
       } else {
         startLimitReachedRumbleFeedback();
-        Serial.println(F("Timelapse max speed stage already at minimum (1)."));
+        Serial.println(F("Timelapse max speed stage already at minimum (0)."));
       }
     } else {
       startLockoutDeniedRumbleFeedback();
@@ -5276,10 +5256,10 @@ void resetTimelapseState() {
   timelapsePhase = TIMELAPSE_PHASE_IDLE;
   timelapsePhaseStartMs = 0;
   timelapseCurrentSpeedStage = 0;
-  digitalWrite(trigger, HIGH);
+  digitalWrite(trigger, TRIGGER_IDLE_STATE);
   stopAllMotors();
   if (wasActive) {
-    normalizeMotionAxisSpeedStages(DEFAULT_AXIS_SPEED_STAGE);
+    normalizeMotionAxisSpeedStages(lastManualMotionAxisSpeedStage);
   }
 }
 
@@ -5289,13 +5269,13 @@ void resetBounceState() {
   stage = 0;
   bouncePhaseStartMs = 0;
   bounceMoveDurationMs = 0;
-  bounceSwingTier = DEFAULT_AXIS_SPEED_STAGE;
-  bouncePanTier = DEFAULT_AXIS_SPEED_STAGE;
-  bounceLiftTier = DEFAULT_AXIS_SPEED_STAGE;
-  bounceTiltTier = DEFAULT_AXIS_SPEED_STAGE;
+  bounceSwingTier = getBounceManualMaxSpeedTier();
+  bouncePanTier = getBounceManualMaxSpeedTier();
+  bounceLiftTier = getBounceManualMaxSpeedTier();
+  bounceTiltTier = getBounceManualMaxSpeedTier();
   stopAllMotors();
   if (wasActive) {
-    normalizeMotionAxisSpeedStages(DEFAULT_AXIS_SPEED_STAGE);
+    normalizeMotionAxisSpeedStages(lastManualMotionAxisSpeedStage);
   }
 }
 
@@ -5339,10 +5319,21 @@ void updateTimelapseModeSelection() {
     lastSelectButtonState = currentSelectButtonState;
     return;
   }
+  timelapseMaxSpeedStage = lastManualMotionAxisSpeedStage;
   const char* tlLabel = getTimelapseModeLabel(timelapseMode);
   if (tlLabel != nullptr) {
     Serial.println(tlLabel);
   }
+  stopAllMotors();
+  normalizeMotionAxisSpeedStages(lastManualMotionAxisSpeedStage);
+  timelapsePhase = TIMELAPSE_PHASE_IDLE;
+  timelapsePhaseStartMs = 0;
+  timelapseCurrentSpeedStage = lastManualMotionAxisSpeedStage;
+  motionFlags = 0;
+  swingSoloMode = 0;
+  liftSoloMode = 0;
+  panStop = PAN_STOP_NONE;
+  tiltStop = TILT_STOP_NONE;
   
   lastSelectButtonState = currentSelectButtonState;
 }
@@ -5539,6 +5530,10 @@ void setBounceModeSpeedTier(uint8_t mode, uint8_t speedTier) {
   uint8_t clampedTier = static_cast<uint8_t>(constrain(static_cast<int>(speedTier),
       static_cast<int>(DRONE_SPEED_TIER_STOP),
       static_cast<int>(DRONE_SPEED_TIER_HIGH)));
+  uint8_t manualMaxTier = getBounceManualMaxSpeedTier();
+  if (clampedTier > manualMaxTier) {
+    clampedTier = manualMaxTier;
+  }
 
   switch (mode) {
     case 1:
@@ -5583,7 +5578,7 @@ uint8_t getBounceSpeedTierForHalf(unsigned long halfElapsedMs, unsigned long hal
     return DRONE_SPEED_TIER_MED;
   }
 
-  return DRONE_SPEED_TIER_HIGH;
+  return getBounceManualMaxSpeedTier();
 }
 
 // Stops only the motors used by the given bounce mode.
@@ -5652,15 +5647,16 @@ void handleBounceStage0(unsigned long now) {
   }
 
   if (bouncePhaseStartMs == 0) {
-    normalizeMotionAxisSpeedStages(DEFAULT_AXIS_SPEED_STAGE);
-    bounceSwingTier = DEFAULT_AXIS_SPEED_STAGE;
-    bouncePanTier = DEFAULT_AXIS_SPEED_STAGE;
-    bounceLiftTier = DEFAULT_AXIS_SPEED_STAGE;
-    bounceTiltTier = DEFAULT_AXIS_SPEED_STAGE;
+    uint8_t manualBounceStage = getBounceManualMaxSpeedTier();
+    normalizeMotionAxisSpeedStages(manualBounceStage);
+    bounceSwingTier = manualBounceStage;
+    bouncePanTier = manualBounceStage;
+    bounceLiftTier = manualBounceStage;
+    bounceTiltTier = manualBounceStage;
     bouncePhaseStartMs = now;
   }
 
-  setBounceModeSpeedTier(bounce, DRONE_SPEED_TIER_HIGH);
+  setBounceModeSpeedTier(bounce, getBounceManualMaxSpeedTier());
   setBounceModeOutputs(bounce, true, HIGH);
 
   // Note: L3 state already tracked in lastL3ButtonState for drone mode
@@ -5712,13 +5708,13 @@ void handleActiveTimelapseMode(unsigned long now) {
 
   switch (timelapsePhase) {
     case TIMELAPSE_PHASE_IDLE:
-      digitalWrite(trigger, HIGH);
+      digitalWrite(trigger, TRIGGER_IDLE_STATE);
       timelapsePhase = TIMELAPSE_PHASE_TRIGGER_LOW;
       timelapsePhaseStartMs = now;
       break;
     case TIMELAPSE_PHASE_TRIGGER_LOW:
       if (now - timelapsePhaseStartMs >= static_cast<unsigned long>(timelapseIntervalMs / 2)) {
-        digitalWrite(trigger, LOW);
+        digitalWrite(trigger, TRIGGER_ACTIVE_STATE);
         timelapsePhase = TIMELAPSE_PHASE_TRIGGER_HIGH;
         timelapsePhaseStartMs = now;
       }
@@ -5730,11 +5726,7 @@ void handleActiveTimelapseMode(unsigned long now) {
             ? TIMELAPSE_PHASE_MOVE_PRELOAD
             : TIMELAPSE_PHASE_MOVE_RAMP_UP;
         timelapsePhaseStartMs = now;
-        timelapseCurrentSpeedStage = 0;
-        if (timelapseAntiBacklashEnabled && timelapseMaxSpeedStage >= 1) {
-          applyTimelapseSpeedIncrease(timelapseMode);
-          timelapseCurrentSpeedStage = 1;
-        }
+        timelapseCurrentSpeedStage = timelapseMaxSpeedStage;
       }
       break;
     case TIMELAPSE_PHASE_MOVE_PRELOAD:
@@ -6317,10 +6309,17 @@ void loop() {
     return;
   }
 
-  handleAxisSpeedControl(PSB_R1, liftSpeedUp, tiltSpeedUp, "R1_LIFT_TILT_UP");
-  handleAxisSpeedControl(PSB_R2, liftSpeedDown, tiltSpeedDown, "R2_LIFT_TILT_DOWN");
-  handleAxisSpeedControl(PSB_L1, panSpeedUp, swingSpeedUp, "L1_PAN_SWING_UP");
-  handleAxisSpeedControl(PSB_L2, panSpeedDown, swingSpeedDown, "L2_PAN_SWING_DOWN");
+  if (timelapseMode != 0) {
+    handleFocusAxis();
+    handleActiveTimelapseMode(now);
+    broadcastModeStatusIfChanged();
+    return;
+  }
+
+  handleAxisSpeedControl(PSB_R1, liftSpeedUp, tiltSpeedUp, 1, "R1_LIFT_TILT_UP");
+  handleAxisSpeedControl(PSB_R2, liftSpeedDown, tiltSpeedDown, -1, "R2_LIFT_TILT_DOWN");
+  handleAxisSpeedControl(PSB_L1, panSpeedUp, swingSpeedUp, 1, "L1_PAN_SWING_UP");
+  handleAxisSpeedControl(PSB_L2, panSpeedDown, swingSpeedDown, -1, "L2_PAN_SWING_DOWN");
   logShoulderSpeedButtonEdges();
 
   if (bounce != 0) {
