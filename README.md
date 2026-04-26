@@ -16,7 +16,18 @@ arduino-cli compile --fqbn arduino:avr:mega --libraries ./libraries ./MEGA__mast
 ## Upload
 
 ```sh
-arduino-cli upload -p /dev/cu.usbmodemXXXX --fqbn arduino:avr:mega --input-dir ./MEGA__master/build/arduino.avr.mega ./MEGA__master
+arduino-cli upload -v -p /dev/cu.usbmodemXXXX --fqbn arduino:avr:mega ./MEGA__master
+```
+
+Notes:
+- `arduino-cli upload` does not take a `--libraries` flag. Libraries are only needed at compile time.
+- Compile first, then upload.
+
+Verified example:
+
+```sh
+arduino-cli compile --fqbn arduino:avr:mega --libraries ./libraries ./MEGA__master
+arduino-cli upload -v -p /dev/cu.usbmodem1401 --fqbn arduino:avr:mega ./MEGA__master
 ```
 
 If you use Arduino IDE, open `MEGA__master/MEGA__master.ino`, select Arduino Mega 2560 and the correct port, then upload.
