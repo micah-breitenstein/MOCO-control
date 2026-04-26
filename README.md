@@ -1,4 +1,4 @@
-# MOCO-Control
+# MOCO-control
 
 Arduino Mega control firmware for the MOCO camera rig, coordinating multi-axis motion, PS2 operator input, and system-level control signals.
 
