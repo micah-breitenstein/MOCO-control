@@ -2981,12 +2981,17 @@ void handleFlowlapseCaptureStep(unsigned long now, float deltaSeconds) {
             completeFlowlapseCapture(now);
             return;
           }
-          flowlapseCapturePhase = FLOWLAPSE_CAPTURE_MOVE_ACTIVE;
-          flowlapseCapturePhaseStartMs = now;
-        } else {
-          flowlapseCapturePhase = FLOWLAPSE_CAPTURE_MOVE_ACTIVE;
-          flowlapseCapturePhaseStartMs = now;
         }
+        // Prime tier state so the motor starts driving immediately — without this,
+        // tierLastChangeMs is stale (30+ s old from alignment) and the tier decrements
+        // to STOP on the very first loop of MOVE_ACTIVE before it can respond to error.
+        resetFlowlapseAxisTierState(now);
+        flowlapseSwingTier = DRONE_SPEED_TIER_MED;
+        flowlapseLiftTier  = DRONE_SPEED_TIER_MED;
+        flowlapsePanTier   = DRONE_SPEED_TIER_MED;
+        flowlapseTiltTier  = DRONE_SPEED_TIER_MED;
+        flowlapseCapturePhase = FLOWLAPSE_CAPTURE_MOVE_ACTIVE;
+        flowlapseCapturePhaseStartMs = now;
       }
       break;
 
