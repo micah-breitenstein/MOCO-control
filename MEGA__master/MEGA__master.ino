@@ -3005,11 +3005,9 @@ void handleFlowlapseCaptureStep(unsigned long now, float deltaSeconds) {
       unsigned long moveDurationMs = static_cast<unsigned long>(stepDist);
       bool useCurvedPath = FLOWLAPSE_CURVED_PATH_ENABLED && flowlapseWaypointCount >= 3;
 
-      float segmentT = (moveDurationMs > 0)
-          ? static_cast<float>(moveElapsedMs) / static_cast<float>(moveDurationMs)
-          : 1.0f;
-      float easedSegmentT = applyFlowlapseEaseInOut(segmentT);
-
+      // Always drive toward the full segment endpoint — time-based interpolation
+      // starting from t=0 produces a target == current position on the first loop,
+      // giving zero error and stalling the motor for the entire move window.
       FlowlapseWaypoint segmentTarget;
       if (flowlapseFrameCountModeActive) {
         uint16_t nextStopIndex = static_cast<uint16_t>(flowlapseFrameCountCurrentStopIndex + 1);
@@ -3018,21 +3016,21 @@ void handleFlowlapseCaptureStep(unsigned long now, float deltaSeconds) {
         float targetPathDistance = getFlowlapsePathTotalLength() * clampFlowlapse01(nextStopFraction);
         segmentTarget = sampleFlowlapsePointAtPathDistance(targetPathDistance, useCurvedPath);
       } else {
-        uint8_t segmentStartIndex = (flowlapseCaptureDirection >= 0)
-            ? static_cast<uint8_t>(flowlapseTargetWaypointIndex - 1)
-            : static_cast<uint8_t>(flowlapseTargetWaypointIndex + 1);
         uint8_t segmentEndIndex = flowlapseTargetWaypointIndex;
         if (useCurvedPath) {
+          uint8_t segmentStartIndex = (flowlapseCaptureDirection >= 0)
+              ? static_cast<uint8_t>(flowlapseTargetWaypointIndex - 1)
+              : static_cast<uint8_t>(flowlapseTargetWaypointIndex + 1);
           uint8_t curveSegmentBaseIndex = (flowlapseCaptureDirection >= 0)
               ? segmentStartIndex
               : segmentEndIndex;
-          float curveDistanceMappedT = mapFlowlapseDistanceFractionToCurveT(curveSegmentBaseIndex, easedSegmentT);
-          float curveT = (flowlapseCaptureDirection >= 0)
-            ? curveDistanceMappedT
-            : (1.0f - curveDistanceMappedT);
+          float curveT = (flowlapseCaptureDirection >= 0) ? 1.0f : 0.0f;
           segmentTarget = interpolateFlowlapseCurvedPoint(curveSegmentBaseIndex, curveT);
         } else {
-          segmentTarget = interpolateFlowlapseLinearPointBetween(segmentStartIndex, segmentEndIndex, easedSegmentT);
+          uint8_t segmentStartIndex = (flowlapseCaptureDirection >= 0)
+              ? static_cast<uint8_t>(flowlapseTargetWaypointIndex - 1)
+              : static_cast<uint8_t>(flowlapseTargetWaypointIndex + 1);
+          segmentTarget = interpolateFlowlapseLinearPointBetween(segmentStartIndex, segmentEndIndex, 1.0f);
         }
       }
       applyFlowlapseMotionTowardWaypoint(segmentTarget, now, deltaSeconds);
