@@ -315,6 +315,7 @@ constexpr float FLOWLAPSE_AXIS_MED_ERROR = 4.0f;
 constexpr float FLOWLAPSE_AXIS_HIGH_ERROR = 12.0f;
 constexpr float FLOWLAPSE_MIN_WAYPOINT_SEPARATION = 2.5f;
 constexpr float FLOWLAPSE_MANUAL_TRACK_RATE_UNITS_PER_SEC = 14.0f;
+constexpr float FLOWLAPSE_FOCUS_TRACK_RATE_UNITS_PER_SEC = 14.0f;
 constexpr float FLOWLAPSE_MED_RATE_UNITS_PER_SEC = 14.0f;
 constexpr float FLOWLAPSE_HIGH_RATE_UNITS_PER_SEC = 18.0f;
 constexpr unsigned long FLOWLAPSE_CAPTURE_PROGRESS_LOG_MS = 2000;
@@ -401,6 +402,7 @@ struct FlowlapseWaypoint {
   float lift;
   float pan;
   float tilt;
+  float focus;
   uint16_t dwellMs;
 };
 
@@ -634,7 +636,7 @@ uint16_t flowlapsePathSegmentCumulative[FLOWLAPSE_MAX_WAYPOINTS - 1];
 
 bool homePoseValid = false;
 bool homeReturnActive = false;
-FlowlapseWaypoint homePose = {0.0f, 0.0f, 0.0f, 0.0f, 0};
+FlowlapseWaypoint homePose = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0};
 
 float flowlapseCurrentSwingPos = 0.0f;
 float flowlapseCurrentLiftPos = 0.0f;
@@ -649,6 +651,9 @@ unsigned long flowlapseSwingTierLastChangeMs = 0;
 unsigned long flowlapseLiftTierLastChangeMs = 0;
 unsigned long flowlapsePanTierLastChangeMs = 0;
 unsigned long flowlapseTiltTierLastChangeMs = 0;
+float flowlapseCurrentFocusPos = 0.0f;
+uint8_t flowlapseFocusTier = DRONE_SPEED_TIER_STOP;
+unsigned long flowlapseFocusTierLastChangeMs = 0;
 uint8_t lastManualMotionAxisSpeedStage = DEFAULT_AXIS_SPEED_STAGE;
 uint8_t droneManualSwingTier = DEFAULT_AXIS_SPEED_STAGE;
 uint8_t droneManualLiftTier = DEFAULT_AXIS_SPEED_STAGE;
@@ -1204,10 +1209,11 @@ FlowlapseWaypoint interpolateFlowlapseLinearPoint(uint8_t segmentStartIndex, flo
 
   float clampedT = clampFlowlapse01(t);
   FlowlapseWaypoint result;
-  result.swing = start.swing + (end.swing - start.swing) * clampedT;
-  result.lift  = start.lift  + (end.lift  - start.lift)  * clampedT;
-  result.pan   = start.pan   + (end.pan   - start.pan)   * clampedT;
-  result.tilt  = start.tilt  + (end.tilt  - start.tilt)  * clampedT;
+  result.swing  = start.swing  + (end.swing  - start.swing)  * clampedT;
+  result.lift   = start.lift   + (end.lift   - start.lift)   * clampedT;
+  result.pan    = start.pan    + (end.pan    - start.pan)    * clampedT;
+  result.tilt   = start.tilt   + (end.tilt   - start.tilt)   * clampedT;
+  result.focus  = start.focus  + (end.focus  - start.focus)  * clampedT;
   return result;
 }
 
@@ -1217,10 +1223,11 @@ FlowlapseWaypoint interpolateFlowlapseLinearPointBetween(uint8_t startIndex, uin
 
   float clampedT = clampFlowlapse01(t);
   FlowlapseWaypoint result;
-  result.swing = start.swing + (end.swing - start.swing) * clampedT;
-  result.lift  = start.lift  + (end.lift  - start.lift)  * clampedT;
-  result.pan   = start.pan   + (end.pan   - start.pan)   * clampedT;
-  result.tilt  = start.tilt  + (end.tilt  - start.tilt)  * clampedT;
+  result.swing  = start.swing  + (end.swing  - start.swing)  * clampedT;
+  result.lift   = start.lift   + (end.lift   - start.lift)   * clampedT;
+  result.pan    = start.pan    + (end.pan    - start.pan)    * clampedT;
+  result.tilt   = start.tilt   + (end.tilt   - start.tilt)   * clampedT;
+  result.focus  = start.focus  + (end.focus  - start.focus)  * clampedT;
   return result;
 }
 
@@ -1246,10 +1253,11 @@ FlowlapseWaypoint interpolateFlowlapseCurvedPoint(uint8_t segmentStartIndex, flo
 
   float clampedT = clampFlowlapse01(t);
   FlowlapseWaypoint result;
-  result.swing = interpolateCatmullRomScalar(p0.swing, p1.swing, p2.swing, p3.swing, clampedT);
-  result.lift  = interpolateCatmullRomScalar(p0.lift,  p1.lift,  p2.lift,  p3.lift,  clampedT);
-  result.pan   = interpolateCatmullRomScalar(p0.pan,   p1.pan,   p2.pan,   p3.pan,   clampedT);
-  result.tilt  = interpolateCatmullRomScalar(p0.tilt,  p1.tilt,  p2.tilt,  p3.tilt,  clampedT);
+  result.swing  = interpolateCatmullRomScalar(p0.swing,  p1.swing,  p2.swing,  p3.swing,  clampedT);
+  result.lift   = interpolateCatmullRomScalar(p0.lift,   p1.lift,   p2.lift,   p3.lift,   clampedT);
+  result.pan    = interpolateCatmullRomScalar(p0.pan,    p1.pan,    p2.pan,    p3.pan,    clampedT);
+  result.tilt   = interpolateCatmullRomScalar(p0.tilt,   p1.tilt,   p2.tilt,   p3.tilt,   clampedT);
+  result.focus  = interpolateCatmullRomScalar(p0.focus,  p1.focus,  p2.focus,  p3.focus,  clampedT);
   return result;
 }
 
@@ -1408,11 +1416,13 @@ void resetFlowlapseAxisTierState(unsigned long now) {
   flowlapseLiftTier = DRONE_SPEED_TIER_STOP;
   flowlapsePanTier = DRONE_SPEED_TIER_STOP;
   flowlapseTiltTier = DRONE_SPEED_TIER_STOP;
+  flowlapseFocusTier = DRONE_SPEED_TIER_STOP;
 
   flowlapseSwingTierLastChangeMs = now;
   flowlapseLiftTierLastChangeMs = now;
   flowlapsePanTierLastChangeMs = now;
   flowlapseTiltTierLastChangeMs = now;
+  flowlapseFocusTierLastChangeMs = now;
 }
 
 void resetFlowlapseSession(bool resetEstimatedPosition) {
@@ -1452,6 +1462,7 @@ void resetFlowlapseSession(bool resetEstimatedPosition) {
     flowlapseCurrentLiftPos = 0.0f;
     flowlapseCurrentPanPos = 0.0f;
     flowlapseCurrentTiltPos = 0.0f;
+    flowlapseCurrentFocusPos = 0.0f;
   }
 
   broadcastFlowlapseWaypointCount();
@@ -1670,6 +1681,12 @@ void updateFlowlapseEstimatedPositionFromManualSticks(float deltaSeconds) {
   updateFlowlapseEstimatedAxisFromStick(leftStickYvalue, isLiftReversed, DRONE_LIFT_DEADBAND, flowlapseCurrentLiftPos, deltaSeconds);
   updateFlowlapseEstimatedAxisFromStick(rightStickXvalue, isPanReversed, DRONE_PAN_DEADBAND, flowlapseCurrentPanPos, deltaSeconds);
   updateFlowlapseEstimatedAxisFromStick(rightStickYvalue, isTiltReversed, DRONE_TILT_DEADBAND, flowlapseCurrentTiltPos, deltaSeconds);
+  // Focus is button-driven: Triangle=macro direction (negative), Cross=infinity direction (positive)
+  if (ps2x.Button(PSB_TRIANGLE)) {
+    flowlapseCurrentFocusPos -= FLOWLAPSE_FOCUS_TRACK_RATE_UNITS_PER_SEC * deltaSeconds;
+  } else if (ps2x.Button(PSB_CROSS)) {
+    flowlapseCurrentFocusPos += FLOWLAPSE_FOCUS_TRACK_RATE_UNITS_PER_SEC * deltaSeconds;
+  }
 }
 
 void captureFlowlapseWaypoint() {
@@ -1684,6 +1701,7 @@ void captureFlowlapseWaypoint() {
   candidateWaypoint.lift = flowlapseCurrentLiftPos;
   candidateWaypoint.pan = flowlapseCurrentPanPos;
   candidateWaypoint.tilt = flowlapseCurrentTiltPos;
+  candidateWaypoint.focus = flowlapseCurrentFocusPos;
   candidateWaypoint.dwellMs = static_cast<uint16_t>(flowlapseDwellMs);
 
   if (flowlapseWaypointCount > 0) {
@@ -1692,11 +1710,14 @@ void captureFlowlapseWaypoint() {
     float deltaLift = candidateWaypoint.lift - previousWaypoint.lift;
     float deltaPan = candidateWaypoint.pan - previousWaypoint.pan;
     float deltaTilt = candidateWaypoint.tilt - previousWaypoint.tilt;
-    float separation = sqrt(deltaSwing * deltaSwing + deltaLift * deltaLift + deltaPan * deltaPan + deltaTilt * deltaTilt);
+    float deltaFocus = candidateWaypoint.focus - previousWaypoint.focus;
+    float spatialSeparation = sqrt(deltaSwing * deltaSwing + deltaLift * deltaLift + deltaPan * deltaPan + deltaTilt * deltaTilt);
+    float focusSeparation = fabs(deltaFocus);
 
-    if (separation < FLOWLAPSE_MIN_WAYPOINT_SEPARATION) {
+    // Accept waypoint if it has enough spatial movement OR enough focus change
+    if (spatialSeparation < FLOWLAPSE_MIN_WAYPOINT_SEPARATION && focusSeparation < FLOWLAPSE_MIN_WAYPOINT_SEPARATION) {
       startLockoutDeniedRumbleFeedback();
-      Serial.println(F("Flowlapse: waypoint too close to previous point; move rig farther before recording."));
+      Serial.println(F("Flowlapse: waypoint too close to previous; move rig or change focus before recording."));
       return;
     }
   }
@@ -1725,15 +1746,18 @@ void captureFlowlapseWaypoint() {
     Serial.print(F(" pan="));
     Serial.print(waypoint.pan, 2);
     Serial.print(F(" tilt="));
-    Serial.println(waypoint.tilt, 2);
+    Serial.print(waypoint.tilt, 2);
+    Serial.print(F(" focus="));
+    Serial.println(waypoint.focus, 2);
   }
 }
 
 bool isFlowlapseTargetReached(const FlowlapseWaypoint& target) {
-  return fabs(target.swing - flowlapseCurrentSwingPos) <= FLOWLAPSE_AXIS_STOP_TOLERANCE
-      && fabs(target.lift  - flowlapseCurrentLiftPos)  <= FLOWLAPSE_AXIS_STOP_TOLERANCE
-      && fabs(target.pan   - flowlapseCurrentPanPos)   <= FLOWLAPSE_AXIS_STOP_TOLERANCE
-      && fabs(target.tilt  - flowlapseCurrentTiltPos)  <= FLOWLAPSE_AXIS_STOP_TOLERANCE;
+  return fabs(target.swing  - flowlapseCurrentSwingPos)  <= FLOWLAPSE_AXIS_STOP_TOLERANCE
+      && fabs(target.lift   - flowlapseCurrentLiftPos)   <= FLOWLAPSE_AXIS_STOP_TOLERANCE
+      && fabs(target.pan    - flowlapseCurrentPanPos)    <= FLOWLAPSE_AXIS_STOP_TOLERANCE
+      && fabs(target.tilt   - flowlapseCurrentTiltPos)   <= FLOWLAPSE_AXIS_STOP_TOLERANCE
+      && fabs(target.focus  - flowlapseCurrentFocusPos)  <= FLOWLAPSE_AXIS_STOP_TOLERANCE;
 }
 
 void applyFlowlapseAxisTowardTarget(float targetPosition, float& estimatedPosition,
@@ -1815,6 +1839,11 @@ void applyFlowlapseMotionTowardWaypoint(const FlowlapseWaypoint& target, unsigne
   applyFlowlapseAxisTowardTarget(target.tilt, flowlapseCurrentTiltPos, isTiltReversed,
                                  tiltUp, tiltDown, tiltSpeedUp, tiltSpeedDown,
                                  flowlapseTiltTier, flowlapseTiltTierLastChangeMs,
+                                 now, deltaSeconds);
+
+  applyFlowlapseAxisTowardTarget(target.focus, flowlapseCurrentFocusPos, isFocusReversed,
+                                 focusLeft, focusRight, focusSpeedUp, focusSpeedDown,
+                                 flowlapseFocusTier, flowlapseFocusTierLastChangeMs,
                                  now, deltaSeconds);
 
   digitalWrite(panSpeedUpOnly, LOW);
@@ -2990,6 +3019,7 @@ void handleFlowlapseCaptureStep(unsigned long now, float deltaSeconds) {
         flowlapseLiftTier  = DRONE_SPEED_TIER_MED;
         flowlapsePanTier   = DRONE_SPEED_TIER_MED;
         flowlapseTiltTier  = DRONE_SPEED_TIER_MED;
+        flowlapseFocusTier = DRONE_SPEED_TIER_MED;
         flowlapseCapturePhase = FLOWLAPSE_CAPTURE_MOVE_ACTIVE;
         flowlapseCapturePhaseStartMs = now;
       }
@@ -3746,6 +3776,12 @@ void handleDroneFlowlapseWorkflow(unsigned long now, float deltaSeconds) {
     stopAllMotors();
     logDroneSpeedModifierStateIfChanged();
     handleFocusAxis();
+    // Track focus estimated position so it's accurate if user adjusts focus before capture
+    if (ps2x.Button(PSB_TRIANGLE)) {
+      flowlapseCurrentFocusPos -= FLOWLAPSE_FOCUS_TRACK_RATE_UNITS_PER_SEC * deltaSeconds;
+    } else if (ps2x.Button(PSB_CROSS)) {
+      flowlapseCurrentFocusPos += FLOWLAPSE_FOCUS_TRACK_RATE_UNITS_PER_SEC * deltaSeconds;
+    }
     return;
   }
 
