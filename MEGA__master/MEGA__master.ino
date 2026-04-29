@@ -174,7 +174,8 @@ enum StatusModeKind : uint8_t {
   STATUS_MODE_MANUAL = 0,
   STATUS_MODE_DRONE,
   STATUS_MODE_TIMELAPSE,
-  STATUS_MODE_BOUNCE
+  STATUS_MODE_BOUNCE,
+  STATUS_MODE_FLOWLAPSE
 };
 
 StatusModeKind lastBroadcastModeKind = STATUS_MODE_MANUAL;
@@ -5396,7 +5397,7 @@ void broadcastModeStatusIfChanged() {
   uint8_t currentModeVariant = 0;
 
   if (droneMode) {
-    currentModeKind = STATUS_MODE_DRONE;
+    currentModeKind = STATUS_MODE_FLOWLAPSE;
   } else if (timelapseMode != 0) {
     currentModeKind = STATUS_MODE_TIMELAPSE;
     currentModeVariant = timelapseMode;
@@ -5415,6 +5416,9 @@ void broadcastModeStatusIfChanged() {
   switch (currentModeKind) {
     case STATUS_MODE_DRONE:
       strcpy(modeLine, "MODE:DRONE");
+      break;
+    case STATUS_MODE_FLOWLAPSE:
+      strcpy(modeLine, "MODE:FLOWLAPSE");
       break;
     case STATUS_MODE_TIMELAPSE:
       snprintf(modeLine, sizeof(modeLine), "MODE:TIMELAPSE %u", currentModeVariant);
