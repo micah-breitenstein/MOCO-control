@@ -299,7 +299,7 @@ constexpr unsigned long DRONE_UI_BROADCAST_INTERVAL_MS = 10;
 constexpr unsigned long DRONE_MODE_EXIT_HOLD_MS = 450;
 constexpr unsigned long DRONE_MANUAL_SHUTTER_PULSE_MS = 120;
 
-constexpr uint8_t FLOWLAPSE_MAX_WAYPOINTS = 8;
+constexpr uint8_t FLOWLAPSE_MAX_WAYPOINTS = 30;
 constexpr bool FLOWLAPSE_LOOP_CAPTURE = false; // if true, capture auto-restarts after completing
 constexpr unsigned long FLOWLAPSE_WAYPOINT_RUMBLE_ON_MS = 90;
 constexpr unsigned long FLOWLAPSE_WAYPOINT_RUMBLE_TOTAL_MS = 180;
