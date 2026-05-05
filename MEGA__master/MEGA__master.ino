@@ -287,7 +287,11 @@ constexpr bool DRONE_ENABLE_BOOST_MODIFIER = true;
 constexpr uint8_t DRONE_FIXED_STICK_SPEED_TIER = DRONE_SPEED_TIER_MED;
 constexpr bool DRONE_L2_PRIORITY_OVER_BOOST = true;
 constexpr float DRONE_MICRO_MOTION_SPEED_RATIO = 0.12f; // L2 precision-mode duty scale
-constexpr unsigned long DRONE_MANUAL_TIER_STEP_INTERVAL_MS = 120;
+constexpr unsigned long DRONE_MANUAL_TIER_ACCEL_INTERVAL_MS    = 450; // ms per tier step up while stick active (accel)
+constexpr unsigned long DRONE_MANUAL_TIER_ACTIVE_DECEL_MS      = 900; // ms per tier step down while stick active (boost→precision)
+constexpr unsigned long DRONE_MANUAL_TIER_RELEASE_DECEL_MS     = 700; // ms per tier step down after stick release
+// Legacy alias used by stepDroneAxisTierTowardTarget accel path:
+constexpr unsigned long DRONE_MANUAL_TIER_STEP_INTERVAL_MS     = DRONE_MANUAL_TIER_ACCEL_INTERVAL_MS;
 constexpr unsigned long DRONE_SPEED_STAGE_PULSE_HIGH_MS = 8;
 constexpr unsigned long DRONE_SPEED_STAGE_PULSE_LOW_MS = 8;
 constexpr unsigned long DRONE_STICK_SPEED_TOGGLE_RUMBLE_ON_MS = 170;
@@ -672,6 +676,14 @@ unsigned long droneManualSwingTierLastStepMs = 0;
 unsigned long droneManualLiftTierLastStepMs = 0;
 unsigned long droneManualPanTierLastStepMs = 0;
 unsigned long droneManualTiltTierLastStepMs = 0;
+bool droneManualSwingDecelerating = false;
+int8_t droneManualSwingLastDir = 0;
+bool droneManualLiftDecelerating = false;
+int8_t droneManualLiftLastDir = 0;
+bool droneManualPanDecelerating = false;
+int8_t droneManualPanLastDir = 0;
+bool droneManualTiltDecelerating = false;
+int8_t droneManualTiltLastDir = 0;
 unsigned long lastDroneUiBroadcastMs = 0;
 int8_t lastBroadcastSwing = 0;
 int8_t lastBroadcastLift = 0;
@@ -1065,7 +1077,12 @@ void stepDroneAxisTierTowardTarget(uint8_t& currentTier,
     return;
   }
 
-  if (now - lastStepMs < DRONE_MANUAL_TIER_STEP_INTERVAL_MS) {
+  // Use a slower interval when stepping DOWN (boost→precision) than when stepping UP.
+  unsigned long requiredInterval = (currentTier > clampedTargetTier)
+      ? DRONE_MANUAL_TIER_ACTIVE_DECEL_MS
+      : DRONE_MANUAL_TIER_ACCEL_INTERVAL_MS;
+
+  if (now - lastStepMs < requiredInterval) {
     return;
   }
 
@@ -1957,6 +1974,10 @@ void enterDroneMode() {
   droneManualLiftTier = DEFAULT_AXIS_SPEED_STAGE;
   droneManualPanTier = DEFAULT_AXIS_SPEED_STAGE;
   droneManualTiltTier = DEFAULT_AXIS_SPEED_STAGE;
+  droneManualSwingDecelerating = false; droneManualSwingLastDir = 0;
+  droneManualLiftDecelerating  = false; droneManualLiftLastDir  = 0;
+  droneManualPanDecelerating   = false; droneManualPanLastDir   = 0;
+  droneManualTiltDecelerating  = false; droneManualTiltLastDir  = 0;
   unsigned long now = millis();
   droneManualSwingTierLastStepMs = now;
   droneManualLiftTierLastStepMs = now;
@@ -1988,6 +2009,10 @@ void exitDroneMode() {
   droneManualLiftTier = DEFAULT_AXIS_SPEED_STAGE;
   droneManualPanTier = DEFAULT_AXIS_SPEED_STAGE;
   droneManualTiltTier = DEFAULT_AXIS_SPEED_STAGE;
+  droneManualSwingDecelerating = false; droneManualSwingLastDir = 0;
+  droneManualLiftDecelerating  = false; droneManualLiftLastDir  = 0;
+  droneManualPanDecelerating   = false; droneManualPanLastDir   = 0;
+  droneManualTiltDecelerating  = false; droneManualTiltLastDir  = 0;
   droneManualSwingTierLastStepMs = 0;
   droneManualLiftTierLastStepMs = 0;
   droneManualPanTierLastStepMs = 0;
@@ -2692,29 +2717,47 @@ void handleFocusAxis() {
   }
 }
 
-// Returns true if the axis is active (outside deadband), false if stopped.
+// Returns true if the axis is active (outside deadband OR still decelerating), false once fully stopped.
 bool applyDroneAxisControl(int stickValue, bool isReversed,
                            uint8_t negativeDirectionPin, uint8_t positiveDirectionPin,
                            uint8_t speedUpPin, uint8_t speedDownPin,
                            int axisDeadband, uint8_t maxSpeedTier, uint8_t expoPercent,
                            uint8_t& currentTier, unsigned long& lastStepMs,
+                           bool& decelerating, int8_t& lastDir,
                            unsigned long now) {
-  // NOTE: do NOT set direction pins LOW here unconditionally. The Nano's
-  // commandActive check is level-sensitive; dropping both LOW on every frame
-  // (~16ms) causes stopMotion() every loop, and a simultaneous speed pulse
-  // then corrupts targetDelay, leaving the Nano stuck blinking indefinitely.
-  // Direction pins are only cleared in the deadband path below.
-
   uint8_t clampedMaxTier = static_cast<uint8_t>(
       constrain(static_cast<int>(maxSpeedTier), DRONE_SPEED_TIER_STOP, DRONE_SPEED_TIER_MAX));
 
   int signedOffsetFromCenter = stickValue - STICK_CENTER;
   if (abs(signedOffsetFromCenter) <= axisDeadband) {
-    // Stick in deadband — release direction pins so Nano stops cleanly.
+    // Stick in deadband: ramp tier down to 0 before releasing direction pins so
+    // the Nano decelerates smoothly rather than getting a hard stop.
+    if (decelerating && currentTier > DRONE_SPEED_TIER_STOP && lastDir != 0) {
+      // Hold last direction HIGH so Nano keeps running during wind-down.
+      if (lastDir < 0) {
+        setDirectionalOutput(isReversed, negativeDirectionPin, positiveDirectionPin, HIGH);
+        setDirectionalOutput(isReversed, positiveDirectionPin, negativeDirectionPin, LOW);
+      } else {
+        setDirectionalOutput(isReversed, positiveDirectionPin, negativeDirectionPin, HIGH);
+        setDirectionalOutput(isReversed, negativeDirectionPin, positiveDirectionPin, LOW);
+      }
+      if (now - lastStepMs >= DRONE_MANUAL_TIER_RELEASE_DECEL_MS) {
+        pulseDroneSpeedStagePin(speedDownPin);
+        if (currentTier > 0) { currentTier--; }
+        lastStepMs = now;
+      }
+      return true; // still active while winding down
+    }
+    // Tier reached 0 or no prior motion — release pins.
     digitalWrite(negativeDirectionPin, LOW);
     digitalWrite(positiveDirectionPin, LOW);
+    decelerating = false;
     return false;
   }
+
+  // Stick active — arm decel for when it returns to center.
+  decelerating = true;
+  lastDir = (stickValue < STICK_CENTER - axisDeadband) ? -1 : 1;
 
   uint8_t targetTier = DRONE_SPEED_TIER_STOP;
   if (droneProportionalStickSpeedEnabled) {
@@ -2752,11 +2795,9 @@ bool applyDroneAxisControl(int stickValue, bool isReversed,
     Serial.println(currentTier);
   }
 
-  // Assert direction: set correct pin HIGH first (Nano keeps seeing commandActive=true),
-  // then clear the opposite pin LOW. This avoids both-LOW gaps during steady-state
-  // motion and handles direction reversal with a brief both-HIGH conflict (which the
-  // Nano resolves cleanly via its directionChangePending logic).
-  if (stickValue < STICK_CENTER - axisDeadband) {
+  // Assert direction: correct pin HIGH first so Nano always sees commandActive=true,
+  // then clear the opposite pin LOW.
+  if (lastDir < 0) {
     setDirectionalOutput(isReversed, negativeDirectionPin, positiveDirectionPin, HIGH);
     setDirectionalOutput(isReversed, positiveDirectionPin, negativeDirectionPin, LOW);
   } else {
@@ -2785,8 +2826,8 @@ void handleDroneStickControl() {
   unsigned long now = millis();
 
   // Left stick controls swing (X) and lift (Y)
-  bool swingActive = applyDroneAxisControl(leftStickXvalue, isSwingReversed, swingLeft, swingRight, swingSpeedUp, swingSpeedDown, DRONE_SWING_DEADBAND, DRONE_SWING_MAX_SPEED_TIER, DRONE_SWING_EXPO_PERCENT, droneManualSwingTier, droneManualSwingTierLastStepMs, now);
-  bool liftActive  = applyDroneAxisControl(leftStickYvalue, isLiftReversed, liftUp, liftDown, liftSpeedUp, liftSpeedDown, DRONE_LIFT_DEADBAND, DRONE_LIFT_MAX_SPEED_TIER, DRONE_LIFT_EXPO_PERCENT, droneManualLiftTier, droneManualLiftTierLastStepMs, now);
+  bool swingActive = applyDroneAxisControl(leftStickXvalue, isSwingReversed, swingLeft, swingRight, swingSpeedUp, swingSpeedDown, DRONE_SWING_DEADBAND, DRONE_SWING_MAX_SPEED_TIER, DRONE_SWING_EXPO_PERCENT, droneManualSwingTier, droneManualSwingTierLastStepMs, droneManualSwingDecelerating, droneManualSwingLastDir, now);
+  bool liftActive  = applyDroneAxisControl(leftStickYvalue, isLiftReversed, liftUp, liftDown, liftSpeedUp, liftSpeedDown, DRONE_LIFT_DEADBAND, DRONE_LIFT_MAX_SPEED_TIER, DRONE_LIFT_EXPO_PERCENT, droneManualLiftTier, droneManualLiftTierLastStepMs, droneManualLiftDecelerating, droneManualLiftLastDir, now);
 
   int8_t swingDirection = 0;
   if (leftStickXvalue < STICK_CENTER - DRONE_SWING_DEADBAND) {
@@ -2803,8 +2844,8 @@ void handleDroneStickControl() {
   }
 
   // Right stick controls pan (X) and tilt (Y)
-  bool panActive  = applyDroneAxisControl(rightStickXvalue, isPanReversed, panLeft, panRight, panSpeedUp, panSpeedDown, DRONE_PAN_DEADBAND, DRONE_PAN_MAX_SPEED_TIER, DRONE_PAN_EXPO_PERCENT, droneManualPanTier, droneManualPanTierLastStepMs, now);
-  bool tiltActive = applyDroneAxisControl(rightStickYvalue, isTiltReversed, tiltUp, tiltDown, tiltSpeedUp, tiltSpeedDown, DRONE_TILT_DEADBAND, DRONE_TILT_MAX_SPEED_TIER, DRONE_TILT_EXPO_PERCENT, droneManualTiltTier, droneManualTiltTierLastStepMs, now);
+  bool panActive  = applyDroneAxisControl(rightStickXvalue, isPanReversed, panLeft, panRight, panSpeedUp, panSpeedDown, DRONE_PAN_DEADBAND, DRONE_PAN_MAX_SPEED_TIER, DRONE_PAN_EXPO_PERCENT, droneManualPanTier, droneManualPanTierLastStepMs, droneManualPanDecelerating, droneManualPanLastDir, now);
+  bool tiltActive = applyDroneAxisControl(rightStickYvalue, isTiltReversed, tiltUp, tiltDown, tiltSpeedUp, tiltSpeedDown, DRONE_TILT_DEADBAND, DRONE_TILT_MAX_SPEED_TIER, DRONE_TILT_EXPO_PERCENT, droneManualTiltTier, droneManualTiltTierLastStepMs, droneManualTiltDecelerating, droneManualTiltLastDir, now);
 
   int8_t panDirection = 0;
   if (rightStickXvalue < STICK_CENTER - DRONE_PAN_DEADBAND) {
