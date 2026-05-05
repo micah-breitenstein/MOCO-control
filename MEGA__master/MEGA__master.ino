@@ -485,6 +485,8 @@ struct PackedFlags {
   uint8_t suppressDroneNextStartRelease : 1;
   uint8_t suppressDroneNextL3Release : 1;
   uint8_t flowlapseL3HoldActive : 1;
+  uint8_t suppressDroneNextL1Release : 1;
+  uint8_t flowlapseL1HoldActive : 1;
   uint8_t flowlapseCaptureAlignedToFirstWaypoint : 1;
   uint8_t flowlapseArcLengthLutValid : 1;
   uint8_t flowlapseFrameCountModeEnabled : 1;
@@ -525,6 +527,8 @@ struct PackedFlags {
       suppressDroneNextStartRelease(false),
       suppressDroneNextL3Release(false),
       flowlapseL3HoldActive(false),
+      suppressDroneNextL1Release(false),
+      flowlapseL1HoldActive(false),
       flowlapseCaptureAlignedToFirstWaypoint(false),
       flowlapseArcLengthLutValid(false),
       flowlapseFrameCountModeEnabled(FLOWLAPSE_FRAME_COUNT_MODE_ENABLED),
@@ -595,9 +599,13 @@ bool lastTimelapseAntiBacklashToggleComboActive = false;
 #define suppressDroneNextStartRelease packedFlags.suppressDroneNextStartRelease
 #define suppressDroneNextL3Release packedFlags.suppressDroneNextL3Release
 #define flowlapseL3HoldActive packedFlags.flowlapseL3HoldActive
+#define suppressDroneNextL1Release packedFlags.suppressDroneNextL1Release
+#define flowlapseL1HoldActive packedFlags.flowlapseL1HoldActive
 #define swingInMotion (isPackedStateSet(motionFlags, MOTION_FLAG_SWING) || swingSoloMode != 0)
 #define liftInMotion (isPackedStateSet(motionFlags, MOTION_FLAG_LIFT) || liftSoloMode != 0)
 unsigned long flowlapseL3HoldStartMs = 0;
+bool lastL1ButtonState = false;
+unsigned long flowlapseL1HoldStartMs = 0;
 unsigned long flowlapseDwellMs = FLOWLAPSE_WAYPOINT_DWELL_MS;
 bool flowlapsePingPongLoopEnabled = FLOWLAPSE_PING_PONG_LOOP;
 bool droneProportionalStickSpeedEnabled = false;
@@ -743,7 +751,7 @@ void broadcastFlowlapseWaypointCount() {
   char waypointCountLine[48];
   snprintf(waypointCountLine, sizeof(waypointCountLine), "WAYPOINT_COUNT:%u/%u",
            static_cast<unsigned int>(flowlapseWaypointCount),
-           static_cast<unsigned int>(FLOWLAPSE_MAX_WAYPOINTS));
+           static_cast<unsigned int>(flowlapseWaypointCount));
   broadcastStatus(waypointCountLine);
 }
 
@@ -1432,6 +1440,9 @@ void resetFlowlapseSession(bool resetEstimatedPosition) {
   flowlapseL3HoldActive = false;
   flowlapseL3HoldStartMs = 0;
   suppressDroneNextL3Release = false;
+  flowlapseL1HoldActive = false;
+  flowlapseL1HoldStartMs = 0;
+  suppressDroneNextL1Release = false;
   flowlapseState = FLOWLAPSE_STATE_RECORDING;
   flowlapseCapturePhase = FLOWLAPSE_CAPTURE_TRIGGER_LOW;
   flowlapseCapturePhaseStartMs = 0;
@@ -1733,7 +1744,7 @@ void captureFlowlapseWaypoint() {
   char waypointLine[64];
   snprintf(waypointLine, sizeof(waypointLine), "Flowlapse: waypoint recorded %u/%u",
            static_cast<unsigned int>(flowlapseWaypointCount),
-           static_cast<unsigned int>(FLOWLAPSE_MAX_WAYPOINTS));
+           static_cast<unsigned int>(flowlapseWaypointCount));
   Serial.println(waypointLine);
   emitControlIndicator("L3_WAYPOINT_RECORD");
   broadcastStatus(waypointLine);
@@ -1868,6 +1879,15 @@ void startFlowlapsePreview() {
   flowlapsePreviewFrameStopIndex = 0;
   Serial.println(F("Flowlapse: returning through recorded waypoints to waypoint 1."));
   broadcastStatus("Flowlapse: returning to waypoint 1.");
+
+  /* Immediately show N/N on the display so count starts from the last waypoint */
+  {
+    char wpStart[48];
+    snprintf(wpStart, sizeof(wpStart), "WAYPOINT_COUNT:%u/%u",
+             static_cast<unsigned int>(flowlapseWaypointCount),
+             static_cast<unsigned int>(flowlapseWaypointCount));
+    broadcastStatus(wpStart);
+  }
 
   resetFlowlapseAxisTierState(millis());
 }
@@ -2679,14 +2699,20 @@ bool applyDroneAxisControl(int stickValue, bool isReversed,
                            int axisDeadband, uint8_t maxSpeedTier, uint8_t expoPercent,
                            uint8_t& currentTier, unsigned long& lastStepMs,
                            unsigned long now) {
-  digitalWrite(negativeDirectionPin, LOW);
-  digitalWrite(positiveDirectionPin, LOW);
+  // NOTE: do NOT set direction pins LOW here unconditionally. The Nano's
+  // commandActive check is level-sensitive; dropping both LOW on every frame
+  // (~16ms) causes stopMotion() every loop, and a simultaneous speed pulse
+  // then corrupts targetDelay, leaving the Nano stuck blinking indefinitely.
+  // Direction pins are only cleared in the deadband path below.
 
   uint8_t clampedMaxTier = static_cast<uint8_t>(
       constrain(static_cast<int>(maxSpeedTier), DRONE_SPEED_TIER_STOP, DRONE_SPEED_TIER_MAX));
 
   int signedOffsetFromCenter = stickValue - STICK_CENTER;
   if (abs(signedOffsetFromCenter) <= axisDeadband) {
+    // Stick in deadband — release direction pins so Nano stops cleanly.
+    digitalWrite(negativeDirectionPin, LOW);
+    digitalWrite(positiveDirectionPin, LOW);
     return false;
   }
 
@@ -2726,13 +2752,20 @@ bool applyDroneAxisControl(int stickValue, bool isReversed,
     Serial.println(currentTier);
   }
 
-  stepDroneAxisTierTowardTarget(currentTier, targetTier, speedUpPin, speedDownPin, lastStepMs, now);
-
+  // Assert direction: set correct pin HIGH first (Nano keeps seeing commandActive=true),
+  // then clear the opposite pin LOW. This avoids both-LOW gaps during steady-state
+  // motion and handles direction reversal with a brief both-HIGH conflict (which the
+  // Nano resolves cleanly via its directionChangePending logic).
   if (stickValue < STICK_CENTER - axisDeadband) {
     setDirectionalOutput(isReversed, negativeDirectionPin, positiveDirectionPin, HIGH);
-  } else if (stickValue > STICK_CENTER + axisDeadband) {
+    setDirectionalOutput(isReversed, positiveDirectionPin, negativeDirectionPin, LOW);
+  } else {
     setDirectionalOutput(isReversed, positiveDirectionPin, negativeDirectionPin, HIGH);
+    setDirectionalOutput(isReversed, negativeDirectionPin, positiveDirectionPin, LOW);
   }
+
+  stepDroneAxisTierTowardTarget(currentTier, targetTier, speedUpPin, speedDownPin, lastStepMs, now);
+
   return true;
 }
 
@@ -2850,6 +2883,15 @@ void completeFlowlapseCapture(unsigned long now) {
       flowlapseTargetWaypointIndex = 1;
     }
 
+    /* Tell the display which waypoint we're now heading toward */
+    {
+      char wpFlip[48];
+      snprintf(wpFlip, sizeof(wpFlip), "WAYPOINT_COUNT:%u/%u",
+               static_cast<unsigned int>(flowlapseTargetWaypointIndex + 1U),
+               static_cast<unsigned int>(flowlapseWaypointCount));
+      broadcastStatus(wpFlip);
+    }
+
     Serial.print(F("Flowlapse: ping-pong edge reached — reversing direction. cycles="));
     Serial.print(static_cast<unsigned int>(flowlapsePingPongEdgeCount / 2U));
     Serial.print(F(" elapsed="));
@@ -2954,13 +2996,24 @@ void handleFlowlapsePreviewStep(unsigned long now, float deltaSeconds) {
 
   if (isFlowlapseTargetReached(target)) {
     stopAllMotors();
+
+    Serial.print(F("Flowlapse return reached waypoint "));
+    Serial.println(static_cast<unsigned int>(flowlapseTargetWaypointIndex + 1));
+
+    /* Broadcast current position so display counts down: N/N → (N-1)/N → ... → 1/N */
+    {
+      char wpReturn[48];
+      snprintf(wpReturn, sizeof(wpReturn), "WAYPOINT_COUNT:%u/%u",
+               static_cast<unsigned int>(flowlapseTargetWaypointIndex + 1U),
+               static_cast<unsigned int>(flowlapseWaypointCount));
+      broadcastStatus(wpReturn);
+    }
+
     if (flowlapseTargetWaypointIndex == 0) {
       completeFlowlapsePreview();
       return;
     }
 
-    Serial.print(F("Flowlapse return reached waypoint "));
-    Serial.println(static_cast<unsigned int>(flowlapseTargetWaypointIndex + 1));
     flowlapseTargetWaypointIndex--;
   }
 }
@@ -3090,6 +3143,19 @@ void handleFlowlapseCaptureStep(unsigned long now, float deltaSeconds) {
 
           bool reachedForwardEnd = (flowlapseCaptureDirection >= 0) && (flowlapseTargetWaypointIndex >= flowlapseWaypointCount);
           bool reachedReverseEnd = (flowlapseCaptureDirection < 0) && (flowlapseTargetWaypointIndex == 255);
+
+          /* Broadcast waypoint arrival so the display counts up/down immediately */
+          {
+            char wpArrival[48];
+            uint8_t shownIndex = reachedReverseEnd
+                ? 1U  /* just arrived at WP1 — reverse end */
+                : static_cast<uint8_t>(reachedWaypointIndex + 1U);
+            snprintf(wpArrival, sizeof(wpArrival), "WAYPOINT_COUNT:%u/%u",
+                     static_cast<unsigned int>(shownIndex),
+                     static_cast<unsigned int>(flowlapseWaypointCount));
+            broadcastStatus(wpArrival);
+          }
+
           if (reachedForwardEnd || reachedReverseEnd) {
             completeFlowlapseCapture(now);
             return;
@@ -3513,6 +3579,40 @@ bool handleDroneFlowlapseButtons(unsigned long now) {
   if (l3JustReleased) {
     if (suppressDroneNextL3Release) {
       suppressDroneNextL3Release = false;
+    } else if (flowlapseState == FLOWLAPSE_STATE_RECORDING) {
+      captureFlowlapseWaypoint();
+      droneLastActivityMs = now;
+    }
+  }
+
+  /* L1 mirrors L3: hold to reset course, tap to record waypoint */
+  if (l3HoldEligible && ps2x.Button(PSB_L1)) {
+    if (!flowlapseL1HoldActive) {
+      flowlapseL1HoldActive = true;
+      flowlapseL1HoldStartMs = now;
+    } else if (now - flowlapseL1HoldStartMs >= FLOWLAPSE_L3_RESET_HOLD_MS) {
+      resetFlowlapseSession(false);
+      stopAllMotors();
+      startFeedbackRumble(2, FLOWLAPSE_WAYPOINT_RUMBLE_ON_MS, FLOWLAPSE_WAYPOINT_RUMBLE_TOTAL_MS);
+      Serial.println(F("Flowlapse: L1 hold reset — course cleared, recording re-armed."));
+      broadcastStatus("Flowlapse: L1 hold reset - course cleared, recording re-armed.");
+      flowlapseL1HoldActive = false;
+      flowlapseL1HoldStartMs = 0;
+      suppressDroneNextL1Release = true;
+      droneLastActivityMs = now;
+    }
+  } else {
+    flowlapseL1HoldActive = false;
+    flowlapseL1HoldStartMs = 0;
+  }
+
+  bool currentL1ButtonState = ps2x.Button(PSB_L1);
+  bool l1JustReleased = lastL1ButtonState && !currentL1ButtonState;
+  lastL1ButtonState = currentL1ButtonState;
+
+  if (l1JustReleased) {
+    if (suppressDroneNextL1Release) {
+      suppressDroneNextL1Release = false;
     } else if (flowlapseState == FLOWLAPSE_STATE_RECORDING) {
       captureFlowlapseWaypoint();
       droneLastActivityMs = now;
@@ -5397,7 +5497,9 @@ void broadcastModeStatusIfChanged() {
   uint8_t currentModeVariant = 0;
 
   if (droneMode) {
-    currentModeKind = STATUS_MODE_FLOWLAPSE;
+    currentModeKind = (flowlapseState == FLOWLAPSE_STATE_CAPTURE_RUNNING)
+                      ? STATUS_MODE_FLOWLAPSE
+                      : STATUS_MODE_DRONE;
   } else if (timelapseMode != 0) {
     currentModeKind = STATUS_MODE_TIMELAPSE;
     currentModeVariant = timelapseMode;
