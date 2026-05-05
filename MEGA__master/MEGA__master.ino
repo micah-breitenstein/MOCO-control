@@ -189,7 +189,7 @@ constexpr uint8_t DIP_SWITCH_4 = 39;
 constexpr uint8_t DIP_SWITCH_5 = 41;
 constexpr int EEPROM_SETTINGS_ADDRESS = 0;
 constexpr uint16_t PERSISTED_SETTINGS_MAGIC = 0x4D52;
-constexpr uint8_t PERSISTED_SETTINGS_VERSION = 5;
+constexpr uint8_t PERSISTED_SETTINGS_VERSION = 6;
 constexpr uint8_t PERSISTED_SETTINGS_FLAG_RUMBLE_MUTED = 0x01;
 constexpr uint8_t PERSISTED_SETTINGS_FLAG_HOME_VALID = 0x02;
 constexpr unsigned long CONTROLLER_STARTUP_DELAY_MS = 300;
@@ -287,12 +287,18 @@ constexpr bool DRONE_ENABLE_BOOST_MODIFIER = true;
 constexpr uint8_t DRONE_FIXED_STICK_SPEED_TIER = DRONE_SPEED_TIER_MED;
 constexpr bool DRONE_L2_PRIORITY_OVER_BOOST = true;
 constexpr float DRONE_MICRO_MOTION_SPEED_RATIO = 0.12f; // L2 precision-mode duty scale
-constexpr unsigned long DRONE_MANUAL_TIER_ACCEL_INTERVAL_MS    = 1100; // ms per tier step up while stick active (accel)
-constexpr unsigned long DRONE_MANUAL_TIER_ACTIVE_DECEL_MS      = 1300; // ms per tier step down while stick active (boost→precision)
-constexpr unsigned long DRONE_MANUAL_TIER_RELEASE_DECEL_MS     = 1100; // ms per tier step down after stick release
-constexpr unsigned long DRONE_MANUAL_TIER_REVERSAL_COOLDOWN_MS = 1400; // extra pause before first step when tier direction reverses
-// Legacy alias used by stepDroneAxisTierTowardTarget accel path:
-constexpr unsigned long DRONE_MANUAL_TIER_STEP_INTERVAL_MS     = DRONE_MANUAL_TIER_ACCEL_INTERVAL_MS;
+constexpr unsigned long DEFAULT_DRONE_ACCEL_MS           = 1100;
+constexpr unsigned long DEFAULT_DRONE_ACTIVE_DECEL_MS    = 1300;
+constexpr unsigned long DEFAULT_DRONE_RELEASE_DECEL_MS   = 1100;
+constexpr unsigned long DEFAULT_DRONE_REVERSAL_COOLDOWN_MS = 1400;
+constexpr unsigned long DRONE_RAMP_MIN_MS = 200;
+constexpr unsigned long DRONE_RAMP_MAX_MS = 3000;
+constexpr unsigned long DRONE_COOLDOWN_MIN_MS = 200;
+constexpr unsigned long DRONE_COOLDOWN_MAX_MS = 5000;
+unsigned long droneAccelMs           = DEFAULT_DRONE_ACCEL_MS;           // ms per tier step up while stick active
+unsigned long droneActiveDecelMs     = DEFAULT_DRONE_ACTIVE_DECEL_MS;     // ms per tier step down (boost→precision)
+unsigned long droneReleaseDecelMs    = DEFAULT_DRONE_RELEASE_DECEL_MS;    // ms per tier step down after stick release
+unsigned long droneReversalCooldownMs = DEFAULT_DRONE_REVERSAL_COOLDOWN_MS; // pause before first step when direction reverses
 constexpr unsigned long DRONE_SPEED_STAGE_PULSE_HIGH_MS = 8;
 constexpr unsigned long DRONE_SPEED_STAGE_PULSE_LOW_MS = 8;
 constexpr unsigned long DRONE_STICK_SPEED_TOGGLE_RUMBLE_ON_MS = 170;
@@ -400,6 +406,24 @@ struct PersistedSettingsV5 {
   float homeLift;
   float homePan;
   float homeTilt;
+  uint8_t checksum;
+};
+
+struct PersistedSettingsV6 {
+  uint16_t magic;
+  uint8_t version;
+  uint8_t timelapseIntervalSeconds;
+  int stepDist;
+  uint16_t timelapseSettleDwellMs;
+  uint8_t flags;
+  float homeSwing;
+  float homeLift;
+  float homePan;
+  float homeTilt;
+  uint16_t droneAccelMs;
+  uint16_t droneActiveDecelMs;
+  uint16_t droneReleaseDecelMs;
+  uint16_t droneReversalCooldownMs;
   uint8_t checksum;
 };
 
@@ -1090,8 +1114,8 @@ void stepDroneAxisTierTowardTarget(uint8_t& currentTier,
   // rapid speedUp/speedDown pulses bouncing the Nano's stage counter.
   bool dirReversed = (lastTierStepDir != 0 && desiredDir != lastTierStepDir);
   unsigned long requiredInterval = dirReversed
-      ? DRONE_MANUAL_TIER_REVERSAL_COOLDOWN_MS
-      : (desiredDir < 0 ? DRONE_MANUAL_TIER_ACTIVE_DECEL_MS : DRONE_MANUAL_TIER_ACCEL_INTERVAL_MS);
+      ? droneReversalCooldownMs
+      : (desiredDir < 0 ? droneActiveDecelMs : droneAccelMs);
 
   if (now - lastStepMs < requiredInterval) {
     return;
@@ -2754,7 +2778,7 @@ bool applyDroneAxisControl(int stickValue, bool isReversed,
         setDirectionalOutput(isReversed, positiveDirectionPin, negativeDirectionPin, HIGH);
         setDirectionalOutput(isReversed, negativeDirectionPin, positiveDirectionPin, LOW);
       }
-      if (now - lastStepMs >= DRONE_MANUAL_TIER_RELEASE_DECEL_MS) {
+      if (now - lastStepMs >= droneReleaseDecelMs) {
         pulseDroneSpeedStagePin(speedDownPin);
         if (currentTier > 0) { currentTier--; }
         lastStepMs = now;
@@ -4516,19 +4540,81 @@ uint8_t computePersistedSettingsChecksum(const PersistedSettingsV5& settings) {
   return sum;
 }
 
-void writePersistedSettings(const PersistedSettingsV5& settings) {
+uint8_t computePersistedSettingsChecksum(const PersistedSettingsV6& settings) {
+  uint8_t sum = static_cast<uint8_t>((settings.magic & 0xFF)
+      + (settings.magic >> 8)
+      + settings.version
+      + settings.timelapseIntervalSeconds
+      + (settings.stepDist & 0xFF)
+      + ((settings.stepDist >> 8) & 0xFF)
+      + (settings.timelapseSettleDwellMs & 0xFF)
+      + ((settings.timelapseSettleDwellMs >> 8) & 0xFF)
+      + settings.flags
+      + (settings.droneAccelMs & 0xFF)
+      + ((settings.droneAccelMs >> 8) & 0xFF)
+      + (settings.droneActiveDecelMs & 0xFF)
+      + ((settings.droneActiveDecelMs >> 8) & 0xFF)
+      + (settings.droneReleaseDecelMs & 0xFF)
+      + ((settings.droneReleaseDecelMs >> 8) & 0xFF)
+      + (settings.droneReversalCooldownMs & 0xFF)
+      + ((settings.droneReversalCooldownMs >> 8) & 0xFF));
+
+  const uint8_t* homeSwingBytes = reinterpret_cast<const uint8_t*>(&settings.homeSwing);
+  const uint8_t* homeLiftBytes = reinterpret_cast<const uint8_t*>(&settings.homeLift);
+  const uint8_t* homePanBytes = reinterpret_cast<const uint8_t*>(&settings.homePan);
+  const uint8_t* homeTiltBytes = reinterpret_cast<const uint8_t*>(&settings.homeTilt);
+  for (uint8_t i = 0; i < sizeof(float); ++i) {
+    sum = static_cast<uint8_t>(sum + homeSwingBytes[i] + homeLiftBytes[i] + homePanBytes[i] + homeTiltBytes[i]);
+  }
+  return sum;
+}
+
+void writePersistedSettings(const PersistedSettingsV6& settings) {
   const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&settings);
-  for (unsigned int i = 0; i < sizeof(PersistedSettingsV5); ++i) {
+  for (unsigned int i = 0; i < sizeof(PersistedSettingsV6); ++i) {
     EEPROM.update(EEPROM_SETTINGS_ADDRESS + static_cast<int>(i), bytes[i]);
   }
 }
 
 bool loadPersistedSettings() {
+  PersistedSettingsV6 settingsV6;
+  EEPROM.get(EEPROM_SETTINGS_ADDRESS, settingsV6);
+
+  if (settingsV6.magic == PERSISTED_SETTINGS_MAGIC
+      && settingsV6.version == PERSISTED_SETTINGS_VERSION
+      && settingsV6.checksum == computePersistedSettingsChecksum(settingsV6)) {
+    timelapseIntervalSeconds = static_cast<uint8_t>(constrain(
+        static_cast<int>(settingsV6.timelapseIntervalSeconds),
+        TIMELAPSE_INTERVAL_MIN_SECONDS,
+        TIMELAPSE_INTERVAL_MAX_SECONDS));
+    stepDist = constrain(settingsV6.stepDist,
+        TIMELAPSE_STEP_DIST_MIN_MS,
+        TIMELAPSE_STEP_DIST_MAX_MS);
+    timelapseSettleDwellMs = constrain(static_cast<unsigned long>(settingsV6.timelapseSettleDwellMs),
+        TIMELAPSE_SETTLE_DWELL_MIN_MS,
+        TIMELAPSE_SETTLE_DWELL_MAX_MS);
+    rumbleMuted = ((settingsV6.flags & PERSISTED_SETTINGS_FLAG_RUMBLE_MUTED) != 0);
+    homePoseValid = ((settingsV6.flags & PERSISTED_SETTINGS_FLAG_HOME_VALID) != 0);
+    if (homePoseValid) {
+      homePose.swing = settingsV6.homeSwing;
+      homePose.lift = settingsV6.homeLift;
+      homePose.pan = settingsV6.homePan;
+      homePose.tilt = settingsV6.homeTilt;
+      homePose.dwellMs = 0;
+    }
+    droneAccelMs           = constrain(static_cast<unsigned long>(settingsV6.droneAccelMs),           DRONE_RAMP_MIN_MS,     DRONE_RAMP_MAX_MS);
+    droneActiveDecelMs     = constrain(static_cast<unsigned long>(settingsV6.droneActiveDecelMs),     DRONE_RAMP_MIN_MS,     DRONE_RAMP_MAX_MS);
+    droneReleaseDecelMs    = constrain(static_cast<unsigned long>(settingsV6.droneReleaseDecelMs),    DRONE_RAMP_MIN_MS,     DRONE_RAMP_MAX_MS);
+    droneReversalCooldownMs = constrain(static_cast<unsigned long>(settingsV6.droneReversalCooldownMs), DRONE_COOLDOWN_MIN_MS, DRONE_COOLDOWN_MAX_MS);
+    return true;
+  }
+
+  // V5 migration: load all V5 fields, use defaults for new drone ramp values.
   PersistedSettingsV5 settingsV5;
   EEPROM.get(EEPROM_SETTINGS_ADDRESS, settingsV5);
 
   if (settingsV5.magic == PERSISTED_SETTINGS_MAGIC
-      && settingsV5.version == PERSISTED_SETTINGS_VERSION
+      && settingsV5.version == 5
       && settingsV5.checksum == computePersistedSettingsChecksum(settingsV5)) {
     timelapseIntervalSeconds = static_cast<uint8_t>(constrain(
         static_cast<int>(settingsV5.timelapseIntervalSeconds),
@@ -4549,6 +4635,11 @@ bool loadPersistedSettings() {
       homePose.tilt = settingsV5.homeTilt;
       homePose.dwellMs = 0;
     }
+    // Drone ramp defaults — not stored in V5.
+    droneAccelMs            = DEFAULT_DRONE_ACCEL_MS;
+    droneActiveDecelMs      = DEFAULT_DRONE_ACTIVE_DECEL_MS;
+    droneReleaseDecelMs     = DEFAULT_DRONE_RELEASE_DECEL_MS;
+    droneReversalCooldownMs = DEFAULT_DRONE_REVERSAL_COOLDOWN_MS;
     return true;
   }
 
@@ -4556,7 +4647,7 @@ bool loadPersistedSettings() {
   EEPROM.get(EEPROM_SETTINGS_ADDRESS, settingsV4);
 
   if (settingsV4.magic == PERSISTED_SETTINGS_MAGIC
-      && settingsV4.version == PERSISTED_SETTINGS_VERSION
+      && settingsV4.version == 4
       && settingsV4.checksum == computePersistedSettingsChecksum(settingsV4)) {
     timelapseIntervalSeconds = static_cast<uint8_t>(constrain(
         static_cast<int>(settingsV4.timelapseIntervalSeconds),
@@ -4633,7 +4724,7 @@ bool loadPersistedSettings() {
 }
 
 void savePersistedSettings() {
-  PersistedSettingsV5 settings = {};
+  PersistedSettingsV6 settings = {};
   settings.magic = PERSISTED_SETTINGS_MAGIC;
   settings.version = PERSISTED_SETTINGS_VERSION;
   settings.timelapseIntervalSeconds = timelapseIntervalSeconds;
@@ -4652,6 +4743,10 @@ void savePersistedSettings() {
     settings.homePan = homePose.pan;
     settings.homeTilt = homePose.tilt;
   }
+  settings.droneAccelMs            = static_cast<uint16_t>(constrain(droneAccelMs,            DRONE_RAMP_MIN_MS,     DRONE_RAMP_MAX_MS));
+  settings.droneActiveDecelMs      = static_cast<uint16_t>(constrain(droneActiveDecelMs,      DRONE_RAMP_MIN_MS,     DRONE_RAMP_MAX_MS));
+  settings.droneReleaseDecelMs     = static_cast<uint16_t>(constrain(droneReleaseDecelMs,     DRONE_RAMP_MIN_MS,     DRONE_RAMP_MAX_MS));
+  settings.droneReversalCooldownMs = static_cast<uint16_t>(constrain(droneReversalCooldownMs, DRONE_COOLDOWN_MIN_MS, DRONE_COOLDOWN_MAX_MS));
   settings.checksum = computePersistedSettingsChecksum(settings);
   writePersistedSettings(settings);
 }
@@ -4660,6 +4755,10 @@ void restorePersistedSettingDefaults() {
   timelapseIntervalSeconds = DEFAULT_TIMELAPSE_INTERVAL_SECONDS;
   stepDist = DEFAULT_TIMELAPSE_STEP_DIST_MS;
   timelapseSettleDwellMs = DEFAULT_TIMELAPSE_SETTLE_DWELL_MS;
+  droneAccelMs            = DEFAULT_DRONE_ACCEL_MS;
+  droneActiveDecelMs      = DEFAULT_DRONE_ACTIVE_DECEL_MS;
+  droneReleaseDecelMs     = DEFAULT_DRONE_RELEASE_DECEL_MS;
+  droneReversalCooldownMs = DEFAULT_DRONE_REVERSAL_COOLDOWN_MS;
   rumbleMuted = false;
   homePoseValid = false;
   homeReturnActive = false;
@@ -6357,6 +6456,38 @@ void processDisplayCommands() {
             startLockoutDeniedRumbleFeedback();
             broadcastStatus("HOME:BLOCKED");
           }
+        }
+      } else if (strncmp(displayCmdBuf, "SET:DRONE_ACCEL:", 16) == 0) {
+        long val = atol(displayCmdBuf + 16);
+        if (val >= static_cast<long>(DRONE_RAMP_MIN_MS) && val <= static_cast<long>(DRONE_RAMP_MAX_MS)) {
+          droneAccelMs = static_cast<unsigned long>(val);
+          savePersistedSettings();
+          Serial.print(F("Display SET drone accel = "));
+          Serial.println(droneAccelMs);
+        }
+      } else if (strncmp(displayCmdBuf, "SET:DRONE_ACTDECEL:", 19) == 0) {
+        long val = atol(displayCmdBuf + 19);
+        if (val >= static_cast<long>(DRONE_RAMP_MIN_MS) && val <= static_cast<long>(DRONE_RAMP_MAX_MS)) {
+          droneActiveDecelMs = static_cast<unsigned long>(val);
+          savePersistedSettings();
+          Serial.print(F("Display SET drone active decel = "));
+          Serial.println(droneActiveDecelMs);
+        }
+      } else if (strncmp(displayCmdBuf, "SET:DRONE_RELDECEL:", 19) == 0) {
+        long val = atol(displayCmdBuf + 19);
+        if (val >= static_cast<long>(DRONE_RAMP_MIN_MS) && val <= static_cast<long>(DRONE_RAMP_MAX_MS)) {
+          droneReleaseDecelMs = static_cast<unsigned long>(val);
+          savePersistedSettings();
+          Serial.print(F("Display SET drone release decel = "));
+          Serial.println(droneReleaseDecelMs);
+        }
+      } else if (strncmp(displayCmdBuf, "SET:DRONE_COOLDOWN:", 19) == 0) {
+        long val = atol(displayCmdBuf + 19);
+        if (val >= static_cast<long>(DRONE_COOLDOWN_MIN_MS) && val <= static_cast<long>(DRONE_COOLDOWN_MAX_MS)) {
+          droneReversalCooldownMs = static_cast<unsigned long>(val);
+          savePersistedSettings();
+          Serial.print(F("Display SET drone reversal cooldown = "));
+          Serial.println(droneReversalCooldownMs);
         }
       } else if (strncmp(displayCmdBuf, "SETTINGS_SAVED", 14) == 0) {
         if (!isRumbleFeedbackActive()) {
