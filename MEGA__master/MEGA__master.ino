@@ -6507,12 +6507,10 @@ void processDisplayCommands() {
           Serial.println(F("Settings mode deactivated (display)."));
         }
         sendToRGBESP(displayCmdBuf);
-      } else if (strncmp(displayCmdBuf, "SET:TL_START:", 13) == 0) {
-        int mode = atoi(displayCmdBuf + 13);
-        if (mode >= 1 && mode <= 8 && timelapseMode == 0 && bounce == 0
-            && !droneMode && !settingsMode) {
-          resetTimelapseState();
-          timelapseMode = static_cast<uint8_t>(mode);
+      } else if (strncmp(displayCmdBuf, "CMD:TL_START:", 13) == 0) {
+        int variant = atoi(displayCmdBuf + 13);
+        if (variant >= 1 && variant <= 8 && timelapseMode == 0 && bounce == 0 && !droneMode) {
+          timelapseMode = (uint8_t)variant;
           timelapseMaxSpeedStage = lastManualMotionAxisSpeedStage;
           stopAllMotors();
           normalizeMotionAxisSpeedStages(lastManualMotionAxisSpeedStage);
@@ -6524,35 +6522,58 @@ void processDisplayCommands() {
           liftSoloMode = 0;
           panStop = PAN_STOP_NONE;
           tiltStop = TILT_STOP_NONE;
-          const char* tlLabel = getTimelapseModeLabel(timelapseMode);
-          if (tlLabel) Serial.println(tlLabel);
-          char statusBuf[32];
-          snprintf(statusBuf, sizeof(statusBuf), "TIMELAPSE %d", mode);
-          broadcastStatus(statusBuf);
+          Serial.print(F("Web CMD: Timelapse started, variant="));
+          Serial.println(variant);
+          broadcastStatus("WEB_CMD:TL_STARTED");
         } else {
-          Serial.println(F("Web TL_START blocked (active/drone/settings)."));
-          broadcastStatus("TL_START:BLOCKED");
+          Serial.println(F("Web CMD: TL_START blocked (mode already active or invalid variant)."));
+          broadcastStatus("WEB_CMD:TL_BLOCKED");
         }
-      } else if (strncmp(displayCmdBuf, "SET:BOUNCE_START:", 17) == 0) {
-        int mode = atoi(displayCmdBuf + 17);
-        if (mode >= 1 && mode <= 8 && bounce == 0 && timelapseMode == 0
-            && !droneMode && !settingsMode) {
+      } else if (strncmp(displayCmdBuf, "CMD:TL_STOP", 11) == 0) {
+        if (timelapseMode != 0) {
+          resetTimelapseState();
+          Serial.println(F("Web CMD: Timelapse stopped."));
+          broadcastStatus("WEB_CMD:TL_STOPPED");
+        }
+      } else if (strncmp(displayCmdBuf, "CMD:BOUNCE_START:", 17) == 0) {
+        int variant = atoi(displayCmdBuf + 17);
+        if (variant >= 1 && variant <= 8 && bounce == 0 && timelapseMode == 0 && !droneMode) {
+          bounce = (uint8_t)variant;
+          stopAllMotors();
+          normalizeMotionAxisSpeedStages(lastManualMotionAxisSpeedStage);
+          motionFlags = 0;
+          swingSoloMode = 0;
+          liftSoloMode = 0;
+          panStop = PAN_STOP_NONE;
+          tiltStop = TILT_STOP_NONE;
+          const char* bounceLabel = getBounceModeSerialLabel(bounce);
+          if (bounceLabel) Serial.println(bounceLabel);
+          broadcastStatus("WEB_CMD:BOUNCE_STARTED");
+        } else {
+          Serial.println(F("Web CMD: BOUNCE_START blocked."));
+          broadcastStatus("WEB_CMD:BOUNCE_BLOCKED");
+        }
+      } else if (strncmp(displayCmdBuf, "CMD:BOUNCE_STOP", 15) == 0) {
+        if (bounce != 0) {
           resetBounceState();
-          bounce = static_cast<uint8_t>(mode);
-          const char* bLabel = getBounceModeSerialLabel(bounce);
-          if (bLabel) Serial.println(bLabel);
-          char statusBuf[32];
-          snprintf(statusBuf, sizeof(statusBuf), "BOUNCE %d", mode);
-          broadcastStatus(statusBuf);
-        } else {
-          Serial.println(F("Web BOUNCE_START blocked (active/drone/settings)."));
-          broadcastStatus("BOUNCE_START:BLOCKED");
+          Serial.println(F("Web CMD: Bounce stopped."));
+          broadcastStatus("WEB_CMD:BOUNCE_STOPPED");
         }
-      } else if (strncmp(displayCmdBuf, "SET:STOP:1", 10) == 0) {
-        resetTimelapseState();
-        resetBounceState();
-        Serial.println(F("Web remote stop."));
-        broadcastStatus("REMOTE_STOP:OK");
+      } else if (strncmp(displayCmdBuf, "CMD:DRONE_ON", 12) == 0) {
+        if (!droneMode && timelapseMode == 0 && bounce == 0) {
+          droneMode = true;
+          Serial.println(F("Web CMD: Drone mode activated."));
+          broadcastStatus("WEB_CMD:DRONE_ON");
+        } else {
+          broadcastStatus("WEB_CMD:DRONE_BLOCKED");
+        }
+      } else if (strncmp(displayCmdBuf, "CMD:DRONE_OFF", 13) == 0) {
+        if (droneMode) {
+          droneMode = false;
+          stopAllMotors();
+          Serial.println(F("Web CMD: Drone mode deactivated."));
+          broadcastStatus("WEB_CMD:DRONE_OFF");
+        }
       }
       continue;
     }
