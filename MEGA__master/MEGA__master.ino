@@ -6507,6 +6507,52 @@ void processDisplayCommands() {
           Serial.println(F("Settings mode deactivated (display)."));
         }
         sendToRGBESP(displayCmdBuf);
+      } else if (strncmp(displayCmdBuf, "SET:TL_START:", 13) == 0) {
+        int mode = atoi(displayCmdBuf + 13);
+        if (mode >= 1 && mode <= 8 && timelapseMode == 0 && bounce == 0
+            && !droneMode && !settingsMode) {
+          resetTimelapseState();
+          timelapseMode = static_cast<uint8_t>(mode);
+          timelapseMaxSpeedStage = lastManualMotionAxisSpeedStage;
+          stopAllMotors();
+          normalizeMotionAxisSpeedStages(lastManualMotionAxisSpeedStage);
+          timelapsePhase = TIMELAPSE_PHASE_IDLE;
+          timelapsePhaseStartMs = 0;
+          timelapseCurrentSpeedStage = lastManualMotionAxisSpeedStage;
+          motionFlags = 0;
+          swingSoloMode = 0;
+          liftSoloMode = 0;
+          panStop = PAN_STOP_NONE;
+          tiltStop = TILT_STOP_NONE;
+          const char* tlLabel = getTimelapseModeLabel(timelapseMode);
+          if (tlLabel) Serial.println(tlLabel);
+          char statusBuf[32];
+          snprintf(statusBuf, sizeof(statusBuf), "TIMELAPSE %d", mode);
+          broadcastStatus(statusBuf);
+        } else {
+          Serial.println(F("Web TL_START blocked (active/drone/settings)."));
+          broadcastStatus("TL_START:BLOCKED");
+        }
+      } else if (strncmp(displayCmdBuf, "SET:BOUNCE_START:", 17) == 0) {
+        int mode = atoi(displayCmdBuf + 17);
+        if (mode >= 1 && mode <= 8 && bounce == 0 && timelapseMode == 0
+            && !droneMode && !settingsMode) {
+          resetBounceState();
+          bounce = static_cast<uint8_t>(mode);
+          const char* bLabel = getBounceModeSerialLabel(bounce);
+          if (bLabel) Serial.println(bLabel);
+          char statusBuf[32];
+          snprintf(statusBuf, sizeof(statusBuf), "BOUNCE %d", mode);
+          broadcastStatus(statusBuf);
+        } else {
+          Serial.println(F("Web BOUNCE_START blocked (active/drone/settings)."));
+          broadcastStatus("BOUNCE_START:BLOCKED");
+        }
+      } else if (strncmp(displayCmdBuf, "SET:STOP:1", 10) == 0) {
+        resetTimelapseState();
+        resetBounceState();
+        Serial.println(F("Web remote stop."));
+        broadcastStatus("REMOTE_STOP:OK");
       }
       continue;
     }
