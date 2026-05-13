@@ -189,12 +189,12 @@ constexpr uint8_t DIP_SWITCH_4 = 39;
 constexpr uint8_t DIP_SWITCH_5 = 41;
 constexpr int EEPROM_SETTINGS_ADDRESS = 0;
 constexpr uint16_t PERSISTED_SETTINGS_MAGIC = 0x4D52;
-constexpr uint8_t PERSISTED_SETTINGS_VERSION = 5;
+constexpr uint8_t PERSISTED_SETTINGS_VERSION = 6;
 constexpr uint8_t PERSISTED_SETTINGS_FLAG_RUMBLE_MUTED = 0x01;
 constexpr uint8_t PERSISTED_SETTINGS_FLAG_HOME_VALID = 0x02;
 constexpr unsigned long CONTROLLER_STARTUP_DELAY_MS = 300;
 constexpr unsigned long CONTROLLER_RETRY_INTERVAL_MS = 2000;
-constexpr unsigned long CONTROLLER_OK_BROADCAST_INTERVAL_MS = 5000;
+constexpr unsigned long CONTROLLER_OK_BROADCAST_INTERVAL_MS = 1500;
 constexpr uint8_t DEFAULT_AXIS_SPEED_STAGE = 1; // 0=slowest, 4=fastest — set low so L1/R1 have room to go up
 constexpr unsigned long SPEED_STAGE_PULSE_HIGH_MS = 75;
 constexpr unsigned long SPEED_STAGE_PULSE_LOW_MS = 75;
@@ -287,7 +287,18 @@ constexpr bool DRONE_ENABLE_BOOST_MODIFIER = true;
 constexpr uint8_t DRONE_FIXED_STICK_SPEED_TIER = DRONE_SPEED_TIER_MED;
 constexpr bool DRONE_L2_PRIORITY_OVER_BOOST = true;
 constexpr float DRONE_MICRO_MOTION_SPEED_RATIO = 0.12f; // L2 precision-mode duty scale
-constexpr unsigned long DRONE_MANUAL_TIER_STEP_INTERVAL_MS = 120;
+constexpr unsigned long DEFAULT_DRONE_ACCEL_MS           = 1100;
+constexpr unsigned long DEFAULT_DRONE_ACTIVE_DECEL_MS    = 1300;
+constexpr unsigned long DEFAULT_DRONE_RELEASE_DECEL_MS   = 1100;
+constexpr unsigned long DEFAULT_DRONE_REVERSAL_COOLDOWN_MS = 1400;
+constexpr unsigned long DRONE_RAMP_MIN_MS = 200;
+constexpr unsigned long DRONE_RAMP_MAX_MS = 3000;
+constexpr unsigned long DRONE_COOLDOWN_MIN_MS = 200;
+constexpr unsigned long DRONE_COOLDOWN_MAX_MS = 5000;
+unsigned long droneAccelMs           = DEFAULT_DRONE_ACCEL_MS;           // ms per tier step up while stick active
+unsigned long droneActiveDecelMs     = DEFAULT_DRONE_ACTIVE_DECEL_MS;     // ms per tier step down (boost→precision)
+unsigned long droneReleaseDecelMs    = DEFAULT_DRONE_RELEASE_DECEL_MS;    // ms per tier step down after stick release
+unsigned long droneReversalCooldownMs = DEFAULT_DRONE_REVERSAL_COOLDOWN_MS; // pause before first step when direction reverses
 constexpr unsigned long DRONE_SPEED_STAGE_PULSE_HIGH_MS = 8;
 constexpr unsigned long DRONE_SPEED_STAGE_PULSE_LOW_MS = 8;
 constexpr unsigned long DRONE_STICK_SPEED_TOGGLE_RUMBLE_ON_MS = 170;
@@ -296,8 +307,7 @@ constexpr uint8_t DRONE_STICK_SPEED_TOGGLE_PROPORTIONAL_PULSES = 2;
 constexpr uint8_t DRONE_STICK_SPEED_TOGGLE_FIXED_PULSES = 1;
 constexpr unsigned long DRONE_IDLE_TIMEOUT_MS = 0UL; // disabled; exit drone mode with R3
 constexpr bool DRONE_SERIAL_LOG_ENABLED = true; // set false to silence runtime drone logs
-constexpr unsigned long DRONE_UI_BROADCAST_INTERVAL_MS = 100;
-constexpr unsigned long DRONE_MODIFIER_BROADCAST_INTERVAL_MS = 1000;
+constexpr unsigned long DRONE_UI_BROADCAST_INTERVAL_MS = 10;
 constexpr unsigned long DRONE_MODE_EXIT_HOLD_MS = 450;
 constexpr unsigned long DRONE_MANUAL_SHUTTER_PULSE_MS = 120;
 
@@ -396,6 +406,24 @@ struct PersistedSettingsV5 {
   float homeLift;
   float homePan;
   float homeTilt;
+  uint8_t checksum;
+};
+
+struct PersistedSettingsV6 {
+  uint16_t magic;
+  uint8_t version;
+  uint8_t timelapseIntervalSeconds;
+  int stepDist;
+  uint16_t timelapseSettleDwellMs;
+  uint8_t flags;
+  float homeSwing;
+  float homeLift;
+  float homePan;
+  float homeTilt;
+  uint16_t droneAccelMs;
+  uint16_t droneActiveDecelMs;
+  uint16_t droneReleaseDecelMs;
+  uint16_t droneReversalCooldownMs;
   uint8_t checksum;
 };
 
@@ -673,8 +701,19 @@ unsigned long droneManualSwingTierLastStepMs = 0;
 unsigned long droneManualLiftTierLastStepMs = 0;
 unsigned long droneManualPanTierLastStepMs = 0;
 unsigned long droneManualTiltTierLastStepMs = 0;
+bool droneManualSwingDecelerating = false;
+int8_t droneManualSwingLastDir = 0;
+int8_t droneManualSwingLastTierStepDir = 0;
+bool droneManualLiftDecelerating = false;
+int8_t droneManualLiftLastDir = 0;
+int8_t droneManualLiftLastTierStepDir = 0;
+bool droneManualPanDecelerating = false;
+int8_t droneManualPanLastDir = 0;
+int8_t droneManualPanLastTierStepDir = 0;
+bool droneManualTiltDecelerating = false;
+int8_t droneManualTiltLastDir = 0;
+int8_t droneManualTiltLastTierStepDir = 0;
 unsigned long lastDroneUiBroadcastMs = 0;
-unsigned long lastDroneModifierBroadcastMs = 0;
 int8_t lastBroadcastSwing = 0;
 int8_t lastBroadcastLift = 0;
 int8_t lastBroadcastPan = 0;
@@ -1060,6 +1099,7 @@ void stepDroneAxisTierTowardTarget(uint8_t& currentTier,
                                    uint8_t speedUpPin,
                                    uint8_t speedDownPin,
                                    unsigned long& lastStepMs,
+                                   int8_t& lastTierStepDir,
                                    unsigned long now) {
   uint8_t clampedTargetTier = static_cast<uint8_t>(constrain(static_cast<int>(targetTier), DRONE_SPEED_TIER_STOP, DRONE_SPEED_TIER_MAX));
 
@@ -1067,18 +1107,29 @@ void stepDroneAxisTierTowardTarget(uint8_t& currentTier,
     return;
   }
 
-  if (now - lastStepMs < DRONE_MANUAL_TIER_STEP_INTERVAL_MS) {
+  int8_t desiredDir = (currentTier < clampedTargetTier) ? 1 : -1;
+
+  // When the tier direction reverses (e.g. boost released then re-engaged mid-ramp),
+  // impose a longer cooldown before the first step in the new direction. This prevents
+  // rapid speedUp/speedDown pulses bouncing the Nano's stage counter.
+  bool dirReversed = (lastTierStepDir != 0 && desiredDir != lastTierStepDir);
+  unsigned long requiredInterval = dirReversed
+      ? droneReversalCooldownMs
+      : (desiredDir < 0 ? droneActiveDecelMs : droneAccelMs);
+
+  if (now - lastStepMs < requiredInterval) {
     return;
   }
 
   uint8_t oldTier = currentTier;
-  if (currentTier < clampedTargetTier) {
+  if (desiredDir > 0) {
     pulseDroneSpeedStagePin(speedUpPin);
     currentTier++;
   } else {
     pulseDroneSpeedStagePin(speedDownPin);
     currentTier--;
   }
+  lastTierStepDir = desiredDir;
 
   if (DEBUG_DRONE_TIERS) {
     Serial.print(F("DRONE TIER: "));
@@ -1959,6 +2010,10 @@ void enterDroneMode() {
   droneManualLiftTier = DEFAULT_AXIS_SPEED_STAGE;
   droneManualPanTier = DEFAULT_AXIS_SPEED_STAGE;
   droneManualTiltTier = DEFAULT_AXIS_SPEED_STAGE;
+  droneManualSwingDecelerating = false; droneManualSwingLastDir = 0; droneManualSwingLastTierStepDir = 0;
+  droneManualLiftDecelerating  = false; droneManualLiftLastDir  = 0; droneManualLiftLastTierStepDir  = 0;
+  droneManualPanDecelerating   = false; droneManualPanLastDir   = 0; droneManualPanLastTierStepDir   = 0;
+  droneManualTiltDecelerating  = false; droneManualTiltLastDir  = 0; droneManualTiltLastTierStepDir  = 0;
   unsigned long now = millis();
   droneManualSwingTierLastStepMs = now;
   droneManualLiftTierLastStepMs = now;
@@ -1968,9 +2023,6 @@ void enterDroneMode() {
   Serial.println(F("DRONE MODE ACTIVATED - timelapse/bounce locked out"));
   broadcastStatus("MODE:DRONE");
   broadcastStatus("DRONE MODE ACTIVATED - timelapse/bounce locked out");
-  // Immediately broadcast DRONE_MODIFIER so web page can detect drone mode
-  broadcastStatus("DRONE_MODIFIER:precision=0,boost=0");
-  lastDroneModifierBroadcastMs = now;
   Serial.println(F("Flowlapse: recording armed. L3=record waypoint, SELECT=stop record, L1+R1=wipe, L2+R2=undo last."));
   Serial.println(F("Flowlapse: START+SELECT+TRIANGLE toggles frame-count preview/capture mode."));
   Serial.println(F("Flowlapse: START+SELECT+CIRCLE toggles ping-pong loop mode."));
@@ -1993,6 +2045,10 @@ void exitDroneMode() {
   droneManualLiftTier = DEFAULT_AXIS_SPEED_STAGE;
   droneManualPanTier = DEFAULT_AXIS_SPEED_STAGE;
   droneManualTiltTier = DEFAULT_AXIS_SPEED_STAGE;
+  droneManualSwingDecelerating = false; droneManualSwingLastDir = 0; droneManualSwingLastTierStepDir = 0;
+  droneManualLiftDecelerating  = false; droneManualLiftLastDir  = 0; droneManualLiftLastTierStepDir  = 0;
+  droneManualPanDecelerating   = false; droneManualPanLastDir   = 0; droneManualPanLastTierStepDir   = 0;
+  droneManualTiltDecelerating  = false; droneManualTiltLastDir  = 0; droneManualTiltLastTierStepDir  = 0;
   droneManualSwingTierLastStepMs = 0;
   droneManualLiftTierLastStepMs = 0;
   droneManualPanTierLastStepMs = 0;
@@ -2138,8 +2194,8 @@ void broadcastDroneUiStateIfDue(int8_t swingDirection, int8_t liftDirection, int
                        leftStickClick != lastBroadcastLeftStickClick ||
                        rightStickClick != lastBroadcastRightStickClick);
 
-  // Only send when state actually changes - no periodic keepalive to reduce UART load
-  if (!stateChanged) {
+  // Send immediately on change; use interval only as keepalive when idle
+  if (!stateChanged && (now - lastDroneUiBroadcastMs < DRONE_UI_BROADCAST_INTERVAL_MS)) {
     return;
   }
 
@@ -2167,22 +2223,13 @@ void logDroneSpeedModifierStateIfChanged() {
       && ps2x.Button(PSB_R2)
       && !(DRONE_L2_PRIORITY_OVER_BOOST && precisionModeActive);
 
-  unsigned long now = millis();
-  bool modifierStateChanged = (precisionModeActive != lastDronePrecisionModeActive || boostModeActive != lastDroneBoostModeActive);
-  
-  // Send immediately on change; use interval as keepalive when idle
-  if (!modifierStateChanged && (now - lastDroneModifierBroadcastMs < DRONE_MODIFIER_BROADCAST_INTERVAL_MS)) {
-    return;
-  }
+  if (precisionModeActive != lastDronePrecisionModeActive || boostModeActive != lastDroneBoostModeActive) {
+    char modifierLine[48];
+    snprintf(modifierLine, sizeof(modifierLine), "DRONE_MODIFIER:precision=%u,boost=%u",
+             precisionModeActive ? 1U : 0U,
+             boostModeActive ? 1U : 0U);
+    broadcastStatus(modifierLine);
 
-  char modifierLine[48];
-  snprintf(modifierLine, sizeof(modifierLine), "DRONE_MODIFIER:precision=%u,boost=%u",
-           precisionModeActive ? 1U : 0U,
-           boostModeActive ? 1U : 0U);
-  broadcastStatus(modifierLine);
-  lastDroneModifierBroadcastMs = now;
-
-  if (modifierStateChanged) {
     if (DRONE_SERIAL_LOG_ENABLED) {
       Serial.print(F("Drone speed modifier | precision="));
       Serial.print(precisionModeActive ? "ON" : "OFF");
@@ -2706,23 +2753,48 @@ void handleFocusAxis() {
   }
 }
 
-// Returns true if the axis is active (outside deadband), false if stopped.
+// Returns true if the axis is active (outside deadband OR still decelerating), false once fully stopped.
 bool applyDroneAxisControl(int stickValue, bool isReversed,
                            uint8_t negativeDirectionPin, uint8_t positiveDirectionPin,
                            uint8_t speedUpPin, uint8_t speedDownPin,
                            int axisDeadband, uint8_t maxSpeedTier, uint8_t expoPercent,
                            uint8_t& currentTier, unsigned long& lastStepMs,
+                           bool& decelerating, int8_t& lastDir,
+                           int8_t& lastTierStepDir,
                            unsigned long now) {
-  digitalWrite(negativeDirectionPin, LOW);
-  digitalWrite(positiveDirectionPin, LOW);
-
   uint8_t clampedMaxTier = static_cast<uint8_t>(
       constrain(static_cast<int>(maxSpeedTier), DRONE_SPEED_TIER_STOP, DRONE_SPEED_TIER_MAX));
 
   int signedOffsetFromCenter = stickValue - STICK_CENTER;
   if (abs(signedOffsetFromCenter) <= axisDeadband) {
+    // Stick in deadband: ramp tier down to 0 before releasing direction pins so
+    // the Nano decelerates smoothly rather than getting a hard stop.
+    if (decelerating && currentTier > DRONE_SPEED_TIER_STOP && lastDir != 0) {
+      // Hold last direction HIGH so Nano keeps running during wind-down.
+      if (lastDir < 0) {
+        setDirectionalOutput(isReversed, negativeDirectionPin, positiveDirectionPin, HIGH);
+        setDirectionalOutput(isReversed, positiveDirectionPin, negativeDirectionPin, LOW);
+      } else {
+        setDirectionalOutput(isReversed, positiveDirectionPin, negativeDirectionPin, HIGH);
+        setDirectionalOutput(isReversed, negativeDirectionPin, positiveDirectionPin, LOW);
+      }
+      if (now - lastStepMs >= droneReleaseDecelMs) {
+        pulseDroneSpeedStagePin(speedDownPin);
+        if (currentTier > 0) { currentTier--; }
+        lastStepMs = now;
+      }
+      return true; // still active while winding down
+    }
+    // Tier reached 0 or no prior motion — release pins.
+    digitalWrite(negativeDirectionPin, LOW);
+    digitalWrite(positiveDirectionPin, LOW);
+    decelerating = false;
     return false;
   }
+
+  // Stick active — arm decel for when it returns to center.
+  decelerating = true;
+  lastDir = (stickValue < STICK_CENTER - axisDeadband) ? -1 : 1;
 
   uint8_t targetTier = DRONE_SPEED_TIER_STOP;
   if (droneProportionalStickSpeedEnabled) {
@@ -2760,13 +2832,18 @@ bool applyDroneAxisControl(int stickValue, bool isReversed,
     Serial.println(currentTier);
   }
 
-  stepDroneAxisTierTowardTarget(currentTier, targetTier, speedUpPin, speedDownPin, lastStepMs, now);
-
-  if (stickValue < STICK_CENTER - axisDeadband) {
+  // Assert direction: correct pin HIGH first so Nano always sees commandActive=true,
+  // then clear the opposite pin LOW.
+  if (lastDir < 0) {
     setDirectionalOutput(isReversed, negativeDirectionPin, positiveDirectionPin, HIGH);
-  } else if (stickValue > STICK_CENTER + axisDeadband) {
+    setDirectionalOutput(isReversed, positiveDirectionPin, negativeDirectionPin, LOW);
+  } else {
     setDirectionalOutput(isReversed, positiveDirectionPin, negativeDirectionPin, HIGH);
+    setDirectionalOutput(isReversed, negativeDirectionPin, positiveDirectionPin, LOW);
   }
+
+  stepDroneAxisTierTowardTarget(currentTier, targetTier, speedUpPin, speedDownPin, lastStepMs, lastTierStepDir, now);
+
   return true;
 }
 
@@ -2786,8 +2863,8 @@ void handleDroneStickControl() {
   unsigned long now = millis();
 
   // Left stick controls swing (X) and lift (Y)
-  bool swingActive = applyDroneAxisControl(leftStickXvalue, isSwingReversed, swingLeft, swingRight, swingSpeedUp, swingSpeedDown, DRONE_SWING_DEADBAND, DRONE_SWING_MAX_SPEED_TIER, DRONE_SWING_EXPO_PERCENT, droneManualSwingTier, droneManualSwingTierLastStepMs, now);
-  bool liftActive  = applyDroneAxisControl(leftStickYvalue, isLiftReversed, liftUp, liftDown, liftSpeedUp, liftSpeedDown, DRONE_LIFT_DEADBAND, DRONE_LIFT_MAX_SPEED_TIER, DRONE_LIFT_EXPO_PERCENT, droneManualLiftTier, droneManualLiftTierLastStepMs, now);
+  bool swingActive = applyDroneAxisControl(leftStickXvalue, isSwingReversed, swingLeft, swingRight, swingSpeedUp, swingSpeedDown, DRONE_SWING_DEADBAND, DRONE_SWING_MAX_SPEED_TIER, DRONE_SWING_EXPO_PERCENT, droneManualSwingTier, droneManualSwingTierLastStepMs, droneManualSwingDecelerating, droneManualSwingLastDir, droneManualSwingLastTierStepDir, now);
+  bool liftActive  = applyDroneAxisControl(leftStickYvalue, isLiftReversed, liftUp, liftDown, liftSpeedUp, liftSpeedDown, DRONE_LIFT_DEADBAND, DRONE_LIFT_MAX_SPEED_TIER, DRONE_LIFT_EXPO_PERCENT, droneManualLiftTier, droneManualLiftTierLastStepMs, droneManualLiftDecelerating, droneManualLiftLastDir, droneManualLiftLastTierStepDir, now);
 
   int8_t swingDirection = 0;
   if (leftStickXvalue < STICK_CENTER - DRONE_SWING_DEADBAND) {
@@ -2804,8 +2881,8 @@ void handleDroneStickControl() {
   }
 
   // Right stick controls pan (X) and tilt (Y)
-  bool panActive  = applyDroneAxisControl(rightStickXvalue, isPanReversed, panLeft, panRight, panSpeedUp, panSpeedDown, DRONE_PAN_DEADBAND, DRONE_PAN_MAX_SPEED_TIER, DRONE_PAN_EXPO_PERCENT, droneManualPanTier, droneManualPanTierLastStepMs, now);
-  bool tiltActive = applyDroneAxisControl(rightStickYvalue, isTiltReversed, tiltUp, tiltDown, tiltSpeedUp, tiltSpeedDown, DRONE_TILT_DEADBAND, DRONE_TILT_MAX_SPEED_TIER, DRONE_TILT_EXPO_PERCENT, droneManualTiltTier, droneManualTiltTierLastStepMs, now);
+  bool panActive  = applyDroneAxisControl(rightStickXvalue, isPanReversed, panLeft, panRight, panSpeedUp, panSpeedDown, DRONE_PAN_DEADBAND, DRONE_PAN_MAX_SPEED_TIER, DRONE_PAN_EXPO_PERCENT, droneManualPanTier, droneManualPanTierLastStepMs, droneManualPanDecelerating, droneManualPanLastDir, droneManualPanLastTierStepDir, now);
+  bool tiltActive = applyDroneAxisControl(rightStickYvalue, isTiltReversed, tiltUp, tiltDown, tiltSpeedUp, tiltSpeedDown, DRONE_TILT_DEADBAND, DRONE_TILT_MAX_SPEED_TIER, DRONE_TILT_EXPO_PERCENT, droneManualTiltTier, droneManualTiltTierLastStepMs, droneManualTiltDecelerating, droneManualTiltLastDir, droneManualTiltLastTierStepDir, now);
 
   int8_t panDirection = 0;
   if (rightStickXvalue < STICK_CENTER - DRONE_PAN_DEADBAND) {
@@ -4463,19 +4540,81 @@ uint8_t computePersistedSettingsChecksum(const PersistedSettingsV5& settings) {
   return sum;
 }
 
-void writePersistedSettings(const PersistedSettingsV5& settings) {
+uint8_t computePersistedSettingsChecksum(const PersistedSettingsV6& settings) {
+  uint8_t sum = static_cast<uint8_t>((settings.magic & 0xFF)
+      + (settings.magic >> 8)
+      + settings.version
+      + settings.timelapseIntervalSeconds
+      + (settings.stepDist & 0xFF)
+      + ((settings.stepDist >> 8) & 0xFF)
+      + (settings.timelapseSettleDwellMs & 0xFF)
+      + ((settings.timelapseSettleDwellMs >> 8) & 0xFF)
+      + settings.flags
+      + (settings.droneAccelMs & 0xFF)
+      + ((settings.droneAccelMs >> 8) & 0xFF)
+      + (settings.droneActiveDecelMs & 0xFF)
+      + ((settings.droneActiveDecelMs >> 8) & 0xFF)
+      + (settings.droneReleaseDecelMs & 0xFF)
+      + ((settings.droneReleaseDecelMs >> 8) & 0xFF)
+      + (settings.droneReversalCooldownMs & 0xFF)
+      + ((settings.droneReversalCooldownMs >> 8) & 0xFF));
+
+  const uint8_t* homeSwingBytes = reinterpret_cast<const uint8_t*>(&settings.homeSwing);
+  const uint8_t* homeLiftBytes = reinterpret_cast<const uint8_t*>(&settings.homeLift);
+  const uint8_t* homePanBytes = reinterpret_cast<const uint8_t*>(&settings.homePan);
+  const uint8_t* homeTiltBytes = reinterpret_cast<const uint8_t*>(&settings.homeTilt);
+  for (uint8_t i = 0; i < sizeof(float); ++i) {
+    sum = static_cast<uint8_t>(sum + homeSwingBytes[i] + homeLiftBytes[i] + homePanBytes[i] + homeTiltBytes[i]);
+  }
+  return sum;
+}
+
+void writePersistedSettings(const PersistedSettingsV6& settings) {
   const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&settings);
-  for (unsigned int i = 0; i < sizeof(PersistedSettingsV5); ++i) {
+  for (unsigned int i = 0; i < sizeof(PersistedSettingsV6); ++i) {
     EEPROM.update(EEPROM_SETTINGS_ADDRESS + static_cast<int>(i), bytes[i]);
   }
 }
 
 bool loadPersistedSettings() {
+  PersistedSettingsV6 settingsV6;
+  EEPROM.get(EEPROM_SETTINGS_ADDRESS, settingsV6);
+
+  if (settingsV6.magic == PERSISTED_SETTINGS_MAGIC
+      && settingsV6.version == PERSISTED_SETTINGS_VERSION
+      && settingsV6.checksum == computePersistedSettingsChecksum(settingsV6)) {
+    timelapseIntervalSeconds = static_cast<uint8_t>(constrain(
+        static_cast<int>(settingsV6.timelapseIntervalSeconds),
+        TIMELAPSE_INTERVAL_MIN_SECONDS,
+        TIMELAPSE_INTERVAL_MAX_SECONDS));
+    stepDist = constrain(settingsV6.stepDist,
+        TIMELAPSE_STEP_DIST_MIN_MS,
+        TIMELAPSE_STEP_DIST_MAX_MS);
+    timelapseSettleDwellMs = constrain(static_cast<unsigned long>(settingsV6.timelapseSettleDwellMs),
+        TIMELAPSE_SETTLE_DWELL_MIN_MS,
+        TIMELAPSE_SETTLE_DWELL_MAX_MS);
+    rumbleMuted = ((settingsV6.flags & PERSISTED_SETTINGS_FLAG_RUMBLE_MUTED) != 0);
+    homePoseValid = ((settingsV6.flags & PERSISTED_SETTINGS_FLAG_HOME_VALID) != 0);
+    if (homePoseValid) {
+      homePose.swing = settingsV6.homeSwing;
+      homePose.lift = settingsV6.homeLift;
+      homePose.pan = settingsV6.homePan;
+      homePose.tilt = settingsV6.homeTilt;
+      homePose.dwellMs = 0;
+    }
+    droneAccelMs           = constrain(static_cast<unsigned long>(settingsV6.droneAccelMs),           DRONE_RAMP_MIN_MS,     DRONE_RAMP_MAX_MS);
+    droneActiveDecelMs     = constrain(static_cast<unsigned long>(settingsV6.droneActiveDecelMs),     DRONE_RAMP_MIN_MS,     DRONE_RAMP_MAX_MS);
+    droneReleaseDecelMs    = constrain(static_cast<unsigned long>(settingsV6.droneReleaseDecelMs),    DRONE_RAMP_MIN_MS,     DRONE_RAMP_MAX_MS);
+    droneReversalCooldownMs = constrain(static_cast<unsigned long>(settingsV6.droneReversalCooldownMs), DRONE_COOLDOWN_MIN_MS, DRONE_COOLDOWN_MAX_MS);
+    return true;
+  }
+
+  // V5 migration: load all V5 fields, use defaults for new drone ramp values.
   PersistedSettingsV5 settingsV5;
   EEPROM.get(EEPROM_SETTINGS_ADDRESS, settingsV5);
 
   if (settingsV5.magic == PERSISTED_SETTINGS_MAGIC
-      && settingsV5.version == PERSISTED_SETTINGS_VERSION
+      && settingsV5.version == 5
       && settingsV5.checksum == computePersistedSettingsChecksum(settingsV5)) {
     timelapseIntervalSeconds = static_cast<uint8_t>(constrain(
         static_cast<int>(settingsV5.timelapseIntervalSeconds),
@@ -4496,6 +4635,11 @@ bool loadPersistedSettings() {
       homePose.tilt = settingsV5.homeTilt;
       homePose.dwellMs = 0;
     }
+    // Drone ramp defaults — not stored in V5.
+    droneAccelMs            = DEFAULT_DRONE_ACCEL_MS;
+    droneActiveDecelMs      = DEFAULT_DRONE_ACTIVE_DECEL_MS;
+    droneReleaseDecelMs     = DEFAULT_DRONE_RELEASE_DECEL_MS;
+    droneReversalCooldownMs = DEFAULT_DRONE_REVERSAL_COOLDOWN_MS;
     return true;
   }
 
@@ -4503,7 +4647,7 @@ bool loadPersistedSettings() {
   EEPROM.get(EEPROM_SETTINGS_ADDRESS, settingsV4);
 
   if (settingsV4.magic == PERSISTED_SETTINGS_MAGIC
-      && settingsV4.version == PERSISTED_SETTINGS_VERSION
+      && settingsV4.version == 4
       && settingsV4.checksum == computePersistedSettingsChecksum(settingsV4)) {
     timelapseIntervalSeconds = static_cast<uint8_t>(constrain(
         static_cast<int>(settingsV4.timelapseIntervalSeconds),
@@ -4580,7 +4724,7 @@ bool loadPersistedSettings() {
 }
 
 void savePersistedSettings() {
-  PersistedSettingsV5 settings = {};
+  PersistedSettingsV6 settings = {};
   settings.magic = PERSISTED_SETTINGS_MAGIC;
   settings.version = PERSISTED_SETTINGS_VERSION;
   settings.timelapseIntervalSeconds = timelapseIntervalSeconds;
@@ -4599,6 +4743,10 @@ void savePersistedSettings() {
     settings.homePan = homePose.pan;
     settings.homeTilt = homePose.tilt;
   }
+  settings.droneAccelMs            = static_cast<uint16_t>(constrain(droneAccelMs,            DRONE_RAMP_MIN_MS,     DRONE_RAMP_MAX_MS));
+  settings.droneActiveDecelMs      = static_cast<uint16_t>(constrain(droneActiveDecelMs,      DRONE_RAMP_MIN_MS,     DRONE_RAMP_MAX_MS));
+  settings.droneReleaseDecelMs     = static_cast<uint16_t>(constrain(droneReleaseDecelMs,     DRONE_RAMP_MIN_MS,     DRONE_RAMP_MAX_MS));
+  settings.droneReversalCooldownMs = static_cast<uint16_t>(constrain(droneReversalCooldownMs, DRONE_COOLDOWN_MIN_MS, DRONE_COOLDOWN_MAX_MS));
   settings.checksum = computePersistedSettingsChecksum(settings);
   writePersistedSettings(settings);
 }
@@ -4607,6 +4755,10 @@ void restorePersistedSettingDefaults() {
   timelapseIntervalSeconds = DEFAULT_TIMELAPSE_INTERVAL_SECONDS;
   stepDist = DEFAULT_TIMELAPSE_STEP_DIST_MS;
   timelapseSettleDwellMs = DEFAULT_TIMELAPSE_SETTLE_DWELL_MS;
+  droneAccelMs            = DEFAULT_DRONE_ACCEL_MS;
+  droneActiveDecelMs      = DEFAULT_DRONE_ACTIVE_DECEL_MS;
+  droneReleaseDecelMs     = DEFAULT_DRONE_RELEASE_DECEL_MS;
+  droneReversalCooldownMs = DEFAULT_DRONE_REVERSAL_COOLDOWN_MS;
   rumbleMuted = false;
   homePoseValid = false;
   homeReturnActive = false;
@@ -6087,7 +6239,7 @@ void printDroneTuningProfile() {
 void setup() {
 
   Serial.begin(115200);
-  Serial1.begin(230400);
+  Serial1.begin(115200);
   Serial2.begin(115200);
   Serial.println(F("BUILD: SPEED_LOG_V2 (WILL_TEST_SPEED_BUILD)"));
   bool persistedSettingsLoaded = loadPersistedSettings();
@@ -6207,7 +6359,15 @@ void processDisplayCommands() {
       displayCmdBuf[displayCmdLen] = '\0';
       displayCmdLen = 0;
 
-      if (strncmp(displayCmdBuf, "SET:TL_INT:", 11) == 0) {
+      if (strncmp(displayCmdBuf, "SET:TRIGGER:DRONE", 17) == 0) {
+        if (droneMode) {
+          digitalWrite(trigger, TRIGGER_ACTIVE_STATE);
+          delay(DRONE_MANUAL_SHUTTER_PULSE_MS);
+          digitalWrite(trigger, TRIGGER_IDLE_STATE);
+          Serial.println(F("Web camera trigger"));
+          broadcastStatus("TRIGGER:MANUAL_DRONE");
+        }
+      } else if (strncmp(displayCmdBuf, "SET:TL_INT:", 11) == 0) {
         int val = atoi(displayCmdBuf + 11);
         if (val >= TIMELAPSE_INTERVAL_MIN_SECONDS && val <= TIMELAPSE_INTERVAL_MAX_SECONDS) {
           int delta = val - timelapseIntervalSeconds;
@@ -6272,20 +6432,6 @@ void processDisplayCommands() {
             startRumbleUnmuteFeedback();
           }
         }
-      } else if (strncmp(displayCmdBuf, "SET:R_MUTE:", 11) == 0) {
-        /* Handle short-form rumble mute command from ESP32 */
-        bool newMuted = (displayCmdBuf[11] == '1');
-        if (newMuted != rumbleMuted) {
-          rumbleMuted = newMuted;
-          stopIntervalRumbleFeedback();
-          savePersistedSettings();
-          Serial.print(F("Display SET rumble "));
-          Serial.println(rumbleMuted ? "muted." : "unmuted.");
-          broadcastStatus(rumbleMuted ? "RUMBLE_MUTE:ON" : "RUMBLE_MUTE:OFF");
-          if (!rumbleMuted) {
-            startRumbleUnmuteFeedback();
-          }
-        }
       } else if (strncmp(displayCmdBuf, "SET:MTX_BRT:", 12) == 0) {
         sendToRGBESP(displayCmdBuf);
         Serial.print(F("Display "));
@@ -6319,99 +6465,37 @@ void processDisplayCommands() {
             broadcastStatus("HOME:BLOCKED");
           }
         }
-      } else if (strncmp(displayCmdBuf, "SET:TL_START:", 13) == 0) {
-        int mode = atoi(displayCmdBuf + 13);
-        if (mode >= 1 && mode <= 6 && !droneMode && timelapseMode == 0) {
-          timelapseMode = (uint8_t)mode;
-          timelapseMaxSpeedStage = lastManualMotionAxisSpeedStage;
-          stopAllMotors();
-          normalizeMotionAxisSpeedStages(lastManualMotionAxisSpeedStage);
-          timelapsePhase = TIMELAPSE_PHASE_IDLE;
-          timelapsePhaseStartMs = 0;
-          timelapseCurrentSpeedStage = lastManualMotionAxisSpeedStage;
-          motionFlags = 0;
-          swingSoloMode = 0;
-          liftSoloMode = 0;
-          panStop = PAN_STOP_NONE;
-          tiltStop = TILT_STOP_NONE;
-          const char* tlLabel = getTimelapseModeLabel(timelapseMode);
-          if (tlLabel != nullptr) {
-            Serial.print(F("Web: "));
-            Serial.println(tlLabel);
-          }
-          startFeedbackRumble(1, FEEDBACK_RUMBLE_ON_MS, FEEDBACK_RUMBLE_TOTAL_MS);
-        } else if (droneMode) {
-          startLockoutDeniedRumbleFeedback();
-          Serial.println(F("Timelapse start blocked: drone mode active"));
-        } else if (timelapseMode != 0) {
-          Serial.println(F("Timelapse already running"));
+      } else if (strncmp(displayCmdBuf, "SET:DRONE_ACCEL:", 16) == 0) {
+        long val = atol(displayCmdBuf + 16);
+        if (val >= static_cast<long>(DRONE_RAMP_MIN_MS) && val <= static_cast<long>(DRONE_RAMP_MAX_MS)) {
+          droneAccelMs = static_cast<unsigned long>(val);
+          savePersistedSettings();
+          Serial.print(F("Display SET drone accel = "));
+          Serial.println(droneAccelMs);
         }
-      } else if (strncmp(displayCmdBuf, "SET:TL_STOP:", 12) == 0) {
-        if (displayCmdBuf[12] == '1' && timelapseMode != 0) {
-          Serial.print(F("Web: Timelapse mode "));
-          Serial.print(timelapseMode);
-          Serial.println(F(" stopped"));
-          resetTimelapseState();
-          startFeedbackRumble(2, FEEDBACK_RUMBLE_ON_MS, FEEDBACK_RUMBLE_TOTAL_MS);
+      } else if (strncmp(displayCmdBuf, "SET:DRONE_ACTDECEL:", 19) == 0) {
+        long val = atol(displayCmdBuf + 19);
+        if (val >= static_cast<long>(DRONE_RAMP_MIN_MS) && val <= static_cast<long>(DRONE_RAMP_MAX_MS)) {
+          droneActiveDecelMs = static_cast<unsigned long>(val);
+          savePersistedSettings();
+          Serial.print(F("Display SET drone active decel = "));
+          Serial.println(droneActiveDecelMs);
         }
-      } else if (strncmp(displayCmdBuf, "SET:BOUNCE_START:", 17) == 0) {
-        int mode = atoi(displayCmdBuf + 17);
-        if (mode >= 1 && mode <= 8 && !droneMode && bounce == 0) {
-          bounce = (uint8_t)mode;
-          stage = 0;
-          bouncePhaseStartMs = 0;
-          bounceMoveDurationMs = 0;
-          uint8_t manualBounceStage = getBounceManualMaxSpeedTier();
-          bounceSwingTier = manualBounceStage;
-          bouncePanTier = manualBounceStage;
-          bounceLiftTier = manualBounceStage;
-          bounceTiltTier = manualBounceStage;
-          stopAllMotors();
-          normalizeMotionAxisSpeedStages(lastManualMotionAxisSpeedStage);
-          motionFlags = 0;
-          swingSoloMode = 0;
-          liftSoloMode = 0;
-          panStop = PAN_STOP_NONE;
-          tiltStop = TILT_STOP_NONE;
-          const char* bounceLabel = getBounceModeSerialLabel(bounce);
-          if (bounceLabel != nullptr) {
-            Serial.print(F("Web: "));
-            Serial.println(bounceLabel);
-          }
-          startFeedbackRumble(1, FEEDBACK_RUMBLE_ON_MS, FEEDBACK_RUMBLE_TOTAL_MS);
-        } else if (droneMode) {
-          startLockoutDeniedRumbleFeedback();
-          Serial.println(F("Bounce start blocked: drone mode active"));
-        } else if (bounce != 0) {
-          Serial.println(F("Bounce already running"));
+      } else if (strncmp(displayCmdBuf, "SET:DRONE_RELDECEL:", 19) == 0) {
+        long val = atol(displayCmdBuf + 19);
+        if (val >= static_cast<long>(DRONE_RAMP_MIN_MS) && val <= static_cast<long>(DRONE_RAMP_MAX_MS)) {
+          droneReleaseDecelMs = static_cast<unsigned long>(val);
+          savePersistedSettings();
+          Serial.print(F("Display SET drone release decel = "));
+          Serial.println(droneReleaseDecelMs);
         }
-      } else if (strncmp(displayCmdBuf, "SET:BOUNCE_STOP:", 16) == 0) {
-        if (displayCmdBuf[16] == '1' && bounce != 0) {
-          Serial.print(F("Web: Bounce mode "));
-          Serial.print(bounce);
-          Serial.println(F(" stopped"));
-          resetBounceState();
-          startFeedbackRumble(2, FEEDBACK_RUMBLE_ON_MS, FEEDBACK_RUMBLE_TOTAL_MS);
-        }
-      } else if (strncmp(displayCmdBuf, "SET:BOUNCE_DURATION:", 20) == 0) {
-        long val = atol(displayCmdBuf + 20);
-        if (val >= BOUNCE_MIN_MOVE_DURATION_MS && bounce != 0 && stage == 0) {
-          bounceMoveDurationMs = static_cast<unsigned long>(val);
-          bouncePhaseStartMs = millis();
-          stage = 1;
-          Serial.print(F("Web: Bounce duration set to "));
-          Serial.print(bounceMoveDurationMs);
-          Serial.println(F("ms"));
-          startL3EndpointRumbleFeedback();
-          emitControlIndicator("L3_BOUNCE_ENDPOINT");
-        } else if (bounce == 0) {
-          Serial.println(F("Bounce duration command blocked: bounce mode not active"));
-        } else if (stage != 0) {
-          Serial.println(F("Bounce duration command blocked: already in stage 1"));
-        } else if (val < BOUNCE_MIN_MOVE_DURATION_MS) {
-          Serial.print(F("Bounce duration blocked: minimum is "));
-          Serial.print(BOUNCE_MIN_MOVE_DURATION_MS);
-          Serial.println(F("ms"));
+      } else if (strncmp(displayCmdBuf, "SET:DRONE_COOLDOWN:", 19) == 0) {
+        long val = atol(displayCmdBuf + 19);
+        if (val >= static_cast<long>(DRONE_COOLDOWN_MIN_MS) && val <= static_cast<long>(DRONE_COOLDOWN_MAX_MS)) {
+          droneReversalCooldownMs = static_cast<unsigned long>(val);
+          savePersistedSettings();
+          Serial.print(F("Display SET drone reversal cooldown = "));
+          Serial.println(droneReversalCooldownMs);
         }
       } else if (strncmp(displayCmdBuf, "SETTINGS_SAVED", 14) == 0) {
         if (!isRumbleFeedbackActive()) {
@@ -6431,10 +6515,52 @@ void processDisplayCommands() {
           Serial.println(F("Settings mode deactivated (display)."));
         }
         sendToRGBESP(displayCmdBuf);
-      } else if (strncmp(displayCmdBuf, "STATUS_REQUEST", 14) == 0) {
-        /* Force broadcast of current mode status */
-        modeStatusInitialized = false;
-        broadcastModeStatusIfChanged();
+      } else if (strncmp(displayCmdBuf, "SET:TL_START:", 13) == 0) {
+        int mode = atoi(displayCmdBuf + 13);
+        if (mode >= 1 && mode <= 8 && timelapseMode == 0 && bounce == 0
+            && !droneMode && !settingsMode) {
+          resetTimelapseState();
+          timelapseMode = static_cast<uint8_t>(mode);
+          timelapseMaxSpeedStage = lastManualMotionAxisSpeedStage;
+          stopAllMotors();
+          normalizeMotionAxisSpeedStages(lastManualMotionAxisSpeedStage);
+          timelapsePhase = TIMELAPSE_PHASE_IDLE;
+          timelapsePhaseStartMs = 0;
+          timelapseCurrentSpeedStage = lastManualMotionAxisSpeedStage;
+          motionFlags = 0;
+          swingSoloMode = 0;
+          liftSoloMode = 0;
+          panStop = PAN_STOP_NONE;
+          tiltStop = TILT_STOP_NONE;
+          const char* tlLabel = getTimelapseModeLabel(timelapseMode);
+          if (tlLabel) Serial.println(tlLabel);
+          char statusBuf[32];
+          snprintf(statusBuf, sizeof(statusBuf), "TIMELAPSE %d", mode);
+          broadcastStatus(statusBuf);
+        } else {
+          Serial.println(F("Web TL_START blocked (active/drone/settings)."));
+          broadcastStatus("TL_START:BLOCKED");
+        }
+      } else if (strncmp(displayCmdBuf, "SET:BOUNCE_START:", 17) == 0) {
+        int mode = atoi(displayCmdBuf + 17);
+        if (mode >= 1 && mode <= 8 && bounce == 0 && timelapseMode == 0
+            && !droneMode && !settingsMode) {
+          resetBounceState();
+          bounce = static_cast<uint8_t>(mode);
+          const char* bLabel = getBounceModeSerialLabel(bounce);
+          if (bLabel) Serial.println(bLabel);
+          char statusBuf[32];
+          snprintf(statusBuf, sizeof(statusBuf), "BOUNCE %d", mode);
+          broadcastStatus(statusBuf);
+        } else {
+          Serial.println(F("Web BOUNCE_START blocked (active/drone/settings)."));
+          broadcastStatus("BOUNCE_START:BLOCKED");
+        }
+      } else if (strncmp(displayCmdBuf, "SET:STOP:1", 10) == 0) {
+        resetTimelapseState();
+        resetBounceState();
+        Serial.println(F("Web remote stop."));
+        broadcastStatus("REMOTE_STOP:OK");
       }
       continue;
     }
