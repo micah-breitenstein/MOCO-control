@@ -296,7 +296,8 @@ constexpr uint8_t DRONE_STICK_SPEED_TOGGLE_PROPORTIONAL_PULSES = 2;
 constexpr uint8_t DRONE_STICK_SPEED_TOGGLE_FIXED_PULSES = 1;
 constexpr unsigned long DRONE_IDLE_TIMEOUT_MS = 0UL; // disabled; exit drone mode with R3
 constexpr bool DRONE_SERIAL_LOG_ENABLED = true; // set false to silence runtime drone logs
-constexpr unsigned long DRONE_UI_BROADCAST_INTERVAL_MS = 10;
+constexpr unsigned long DRONE_UI_BROADCAST_INTERVAL_MS = 100;
+constexpr unsigned long DRONE_MODIFIER_BROADCAST_INTERVAL_MS = 1000;
 constexpr unsigned long DRONE_MODE_EXIT_HOLD_MS = 450;
 constexpr unsigned long DRONE_MANUAL_SHUTTER_PULSE_MS = 120;
 
@@ -673,6 +674,7 @@ unsigned long droneManualLiftTierLastStepMs = 0;
 unsigned long droneManualPanTierLastStepMs = 0;
 unsigned long droneManualTiltTierLastStepMs = 0;
 unsigned long lastDroneUiBroadcastMs = 0;
+unsigned long lastDroneModifierBroadcastMs = 0;
 int8_t lastBroadcastSwing = 0;
 int8_t lastBroadcastLift = 0;
 int8_t lastBroadcastPan = 0;
@@ -1966,6 +1968,9 @@ void enterDroneMode() {
   Serial.println(F("DRONE MODE ACTIVATED - timelapse/bounce locked out"));
   broadcastStatus("MODE:DRONE");
   broadcastStatus("DRONE MODE ACTIVATED - timelapse/bounce locked out");
+  // Immediately broadcast DRONE_MODIFIER so web page can detect drone mode
+  broadcastStatus("DRONE_MODIFIER:precision=0,boost=0");
+  lastDroneModifierBroadcastMs = now;
   Serial.println(F("Flowlapse: recording armed. L3=record waypoint, SELECT=stop record, L1+R1=wipe, L2+R2=undo last."));
   Serial.println(F("Flowlapse: START+SELECT+TRIANGLE toggles frame-count preview/capture mode."));
   Serial.println(F("Flowlapse: START+SELECT+CIRCLE toggles ping-pong loop mode."));
@@ -2133,8 +2138,8 @@ void broadcastDroneUiStateIfDue(int8_t swingDirection, int8_t liftDirection, int
                        leftStickClick != lastBroadcastLeftStickClick ||
                        rightStickClick != lastBroadcastRightStickClick);
 
-  // Send immediately on change; use interval only as keepalive when idle
-  if (!stateChanged && (now - lastDroneUiBroadcastMs < DRONE_UI_BROADCAST_INTERVAL_MS)) {
+  // Only send when state actually changes - no periodic keepalive to reduce UART load
+  if (!stateChanged) {
     return;
   }
 
@@ -2162,13 +2167,22 @@ void logDroneSpeedModifierStateIfChanged() {
       && ps2x.Button(PSB_R2)
       && !(DRONE_L2_PRIORITY_OVER_BOOST && precisionModeActive);
 
-  if (precisionModeActive != lastDronePrecisionModeActive || boostModeActive != lastDroneBoostModeActive) {
-    char modifierLine[48];
-    snprintf(modifierLine, sizeof(modifierLine), "DRONE_MODIFIER:precision=%u,boost=%u",
-             precisionModeActive ? 1U : 0U,
-             boostModeActive ? 1U : 0U);
-    broadcastStatus(modifierLine);
+  unsigned long now = millis();
+  bool modifierStateChanged = (precisionModeActive != lastDronePrecisionModeActive || boostModeActive != lastDroneBoostModeActive);
+  
+  // Send immediately on change; use interval as keepalive when idle
+  if (!modifierStateChanged && (now - lastDroneModifierBroadcastMs < DRONE_MODIFIER_BROADCAST_INTERVAL_MS)) {
+    return;
+  }
 
+  char modifierLine[48];
+  snprintf(modifierLine, sizeof(modifierLine), "DRONE_MODIFIER:precision=%u,boost=%u",
+           precisionModeActive ? 1U : 0U,
+           boostModeActive ? 1U : 0U);
+  broadcastStatus(modifierLine);
+  lastDroneModifierBroadcastMs = now;
+
+  if (modifierStateChanged) {
     if (DRONE_SERIAL_LOG_ENABLED) {
       Serial.print(F("Drone speed modifier | precision="));
       Serial.print(precisionModeActive ? "ON" : "OFF");
@@ -6073,7 +6087,7 @@ void printDroneTuningProfile() {
 void setup() {
 
   Serial.begin(115200);
-  Serial1.begin(115200);
+  Serial1.begin(230400);
   Serial2.begin(115200);
   Serial.println(F("BUILD: SPEED_LOG_V2 (WILL_TEST_SPEED_BUILD)"));
   bool persistedSettingsLoaded = loadPersistedSettings();
