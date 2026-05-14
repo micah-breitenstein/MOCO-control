@@ -6561,6 +6561,11 @@ void processDisplayCommands() {
         resetBounceState();
         Serial.println(F("Web remote stop."));
         broadcastStatus("REMOTE_STOP:OK");
+      } else if (strncmp(displayCmdBuf, "STATUS_REQUEST", 14) == 0) {
+        // Force broadcast current mode status by resetting the flag
+        modeStatusInitialized = false;
+        broadcastModeStatusIfChanged();
+        Serial.println(F("Status request - broadcasting current mode"));
       }
       continue;
     }
