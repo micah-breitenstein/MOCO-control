@@ -1925,7 +1925,7 @@ void startFlowlapsePreview() {
   }
 
   flowlapseState = FLOWLAPSE_STATE_PREVIEW_RUNNING;
-  flowlapseTargetWaypointIndex = static_cast<uint8_t>(flowlapseWaypointCount - 1);
+  flowlapseTargetWaypointIndex = static_cast<uint8_t>(flowlapseWaypointCount - 1);  /* Start at last waypoint */
   flowlapsePreviewHoldUntilMs = 0;
   flowlapsePreviewFrameModeActive = false;
   flowlapsePreviewFrameTarget = 0;
@@ -1933,7 +1933,7 @@ void startFlowlapsePreview() {
   Serial.println(F("Flowlapse: returning through recorded waypoints to waypoint 1."));
   broadcastStatus("Flowlapse: returning to waypoint 1.");
 
-  /* Immediately show N/N on the display so count starts from the last waypoint */
+  /* Show N/N on display since we're starting at the last waypoint */
   {
     char wpStart[48];
     snprintf(wpStart, sizeof(wpStart), "WAYPOINT_COUNT:%u/%u",
@@ -3008,12 +3008,14 @@ void completeFlowlapseCapture(unsigned long now) {
       flowlapseCaptureAlignedToFirstWaypoint = false;
       flowlapseTargetWaypointIndex = 0;
       flowlapseCaptureDirection = 1;
+      flowlapseWaypointCount = 0;  /* Clear waypoints for next recording session */
       Serial.println(finalProgressMsg);
       broadcastStatus(finalProgressMsg);
-      const char* completionMsg = "Flowlapse: capture complete.";
+      const char* completionMsg = "Flowlapse: capture complete. Recording re-armed.";
       Serial.println(completionMsg);
       broadcastStatus(completionMsg);
       broadcastStatus("MODE:DRONE");
+      broadcastFlowlapseWaypointCount();  /* Broadcast 0/0 to reset displays */
     }
   }
 }
@@ -3074,6 +3076,7 @@ void handleFlowlapsePreviewStep(unsigned long now, float deltaSeconds) {
 
   if (isFlowlapseTargetReached(target)) {
     stopAllMotors();
+    flowlapsePreviewHoldUntilMs = now + FLOWLAPSE_PREVIEW_POINT_HOLD_MS;
 
     Serial.print(F("Flowlapse return reached waypoint "));
     Serial.println(static_cast<unsigned int>(flowlapseTargetWaypointIndex + 1));
@@ -3406,10 +3409,6 @@ bool handleDroneFlowlapseButtons(unsigned long now) {
     droneLastActivityMs = now;
   }
   lastFlowlapseLoopToggleComboActive = loopModeToggleComboActive;
-  if (loopModeToggleComboActive) {
-    stopAllMotors();
-    return true;
-  }
 
   bool frameModeToggleComboActive = ps2x.Button(PSB_START) && ps2x.Button(PSB_SELECT) && ps2x.Button(PSB_TRIANGLE);
   if (frameModeToggleComboActive && !lastFlowlapseFrameModeToggleComboActive) {
@@ -3440,10 +3439,6 @@ bool handleDroneFlowlapseButtons(unsigned long now) {
     droneLastActivityMs = now;
   }
   lastFlowlapseFrameModeToggleComboActive = frameModeToggleComboActive;
-  if (frameModeToggleComboActive) {
-    stopAllMotors();
-    return true;
-  }
 
   bool stickSpeedToggleComboActive = ps2x.Button(PSB_START)
       && ps2x.Button(PSB_SELECT)
@@ -3475,10 +3470,6 @@ bool handleDroneFlowlapseButtons(unsigned long now) {
     droneLastActivityMs = now;
   }
   lastDroneStickSpeedToggleComboActive = stickSpeedToggleComboActive;
-  if (stickSpeedToggleComboActive) {
-    stopAllMotors();
-    return true;
-  }
 
   bool accelProfileCycleEligible = (flowlapseState == FLOWLAPSE_STATE_READY_FOR_PREVIEW
                                  || flowlapseState == FLOWLAPSE_STATE_READY_FOR_CAPTURE);
@@ -3803,8 +3794,12 @@ bool handleDroneFlowlapseButtons(unsigned long now) {
         flowlapseState = FLOWLAPSE_STATE_READY_FOR_PREVIEW;
         stopAllMotors();
         startFeedbackRumble(flowlapseWaypointCount, FLOWLAPSE_WAYPOINT_RUMBLE_ON_MS, FLOWLAPSE_WAYPOINT_RUMBLE_TOTAL_MS);
-        Serial.println(F("Flowlapse: recording stopped. Press SELECT to return to waypoint 1."));
-        broadcastStatus("Flowlapse: recording stopped. Press SELECT to return to waypoint 1.");
+        char recordingStoppedMsg[64];
+        snprintf(recordingStoppedMsg, sizeof(recordingStoppedMsg), "Flowlapse: recording stopped %u/%u. Press SELECT to preview.",
+                 static_cast<unsigned int>(flowlapseWaypointCount),
+                 static_cast<unsigned int>(flowlapseWaypointCount));
+        Serial.println(recordingStoppedMsg);
+        broadcastStatus(recordingStoppedMsg);
       }
       droneLastActivityMs = now;
     } else if (flowlapseState == FLOWLAPSE_STATE_READY_FOR_PREVIEW || flowlapseState == FLOWLAPSE_STATE_READY_FOR_CAPTURE) {
